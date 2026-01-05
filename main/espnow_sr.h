@@ -3,9 +3,16 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-#include "espnow.h"
 #include "esp_wifi.h"
 #include "esp_mac.h"
+#include "state_machine.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "espnow.h"
+#include "espnow_storage.h"
+#include "espnow_utils.h"
 
 
 
@@ -14,6 +21,7 @@ extern "C" {
 #endif
 
 
+extern uint32_t seq ;
 
 /*----------------------传输信息类型----------------------*/
 typedef enum {
@@ -29,6 +37,12 @@ typedef enum {
 } msg_type;
 
 
+typedef struct{
+    msg_type type;
+    uint32_t seq;
+    uint32_t data;
+
+}esp_now_data;
 
 
 
@@ -38,8 +52,8 @@ typedef struct {
 } mac_addr_t;
 
 
-
-
+/*----------------------设备配对任务----------------------*/
+void ms_pairing_task(void *arg);
 
 esp_err_t app_uart_write_handle(uint8_t *src_addr, void *data,
                                        size_t size, wifi_pkt_rx_ctrl_t *rx_ctrl);

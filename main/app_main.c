@@ -24,10 +24,12 @@
 
 
 #include "espnow_sr.h"
-
+#include "state_machine.h"
 
 static const char *TAG = "app_main";
 
+master_state_t m_state = MASTER_IDLE;
+slave_state_t s_state[2] = {SLAVE_IDLE,SLAVE_IDLE};
 
 
 
@@ -54,9 +56,17 @@ void app_main()
 
     espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
     espnow_init(&espnow_config);
+    
+    //初始化完成，开始配对
+
+    xTaskCreate(ms_pairing_task,
+            "ms_pairing",
+            4096,
+            NULL,
+            4,
+            NULL);
 
 
-    //espnow_send(ESPNOW_DATA_TYPE_DATA, ESPNOW_ADDR_BROADCAST, data, size, &frame_head, portMAX_DELAY);
 
-    espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, app_uart_write_handle);
+    //espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, app_uart_write_handle);
 }

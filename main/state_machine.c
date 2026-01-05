@@ -70,35 +70,35 @@ slave_state_t slave_state_machine(slave_state_t cur_state, slave_event_t event)
 
     switch (cur_state) {
         case SLAVE_IDLE:
-            if (event == EVT_MASTER_REQ) {
+            if (event == EVT_RECEIVE_REQ) {
                 next_state = SLAVE_WAIT_MAIN_CONFIRM;
                 ESP_LOGI(TAG, "SLAVE: received master request -> SLAVE_WAIT_MAIN_CONFIRM");
             }
             break;
 
         case SLAVE_WAIT_MAIN_CONFIRM:
-            if (event == EVT_MASTER_CONFIRM) {
+            if (event == EVT_RECEIVE_MASTER_ACK) {
                 next_state = SLAVE_READY;
                 ESP_LOGI(TAG, "SLAVE: received master final confirm -> SLAVE_READY");
             }
             break;
 
-        case SLAVE_READY:
-            if (event == EVT_START_WORK) {
-                next_state = SLAVE_RUNNING;
-                ESP_LOGI(TAG, "SLAVE: start work -> SLAVE_RUNNING");
-            }
-            break;
+        // case SLAVE_READY:
+        //     if (event == EVT_START_WORK) {
+        //         next_state = SLAVE_RUNNING;
+        //         ESP_LOGI(TAG, "SLAVE: start work -> SLAVE_RUNNING");
+        //     }
+        //     break;
 
-        case SLAVE_RUNNING:
-            if (event == EVT_STOP_WORK) {
-                next_state = SLAVE_IDLE;
-                ESP_LOGI(TAG, "SLAVE: stop work -> SLAVE_IDLE");
-            }
-            break;
+        // case SLAVE_RUNNING:
+        //     if (event == EVT_STOP_WORK) {
+        //         next_state = SLAVE_IDLE;
+        //         ESP_LOGI(TAG, "SLAVE: stop work -> SLAVE_IDLE");
+        //     }
+        //     break;
 
         default:
-            if (event == EVT_ERROR) {
+            if (event == EVT_SLAVE_ERROR) {
                 next_state = SLAVE_IDLE;
                 ESP_LOGE(TAG, "SLAVE: error occurred -> SLAVE_IDLE");
             }

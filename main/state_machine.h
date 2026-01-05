@@ -19,6 +19,7 @@ typedef enum {
     MASTER_READY,           // 所有从设备握手完成
     MASTER_RUNNING,         // 正式工作
     MASTER_ERROR,
+    
 } master_state_t;
 
 
