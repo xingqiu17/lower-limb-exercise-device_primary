@@ -33,6 +33,7 @@ slave_state_t s_state[2] = {SLAVE_IDLE,SLAVE_IDLE};
 
 
 
+
 static void app_wifi_init()
 {
     esp_event_loop_create_default();
@@ -57,6 +58,10 @@ void app_main()
     espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
     espnow_init(&espnow_config);
     
+    master_evt_queue = xQueueCreate(8, sizeof(master_evt_msg_t));
+
+
+    espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle);
     //初始化完成，开始配对
 
     xTaskCreate(ms_pairing_task,
@@ -68,5 +73,5 @@ void app_main()
 
 
 
-    //espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, app_uart_write_handle);
+    
 }
