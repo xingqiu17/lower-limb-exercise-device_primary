@@ -185,6 +185,7 @@ void ms_pairing_task(void *arg)
                     case EVT_SLAVE_CONFIRM: {
 
                         nvs_save_slave_mac(evt.slave_mac);
+                        espnow_add_peer(evt.slave_mac, NULL);
 
                         /* 3. 单播确认给该从设备 */
                         esp_now_data confirm = {
