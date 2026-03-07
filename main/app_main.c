@@ -71,6 +71,13 @@ void app_main()
             4,
             NULL);
 
+    xTaskCreate(master_action_verify_task,
+        "action_verify",
+        4096,
+        NULL,
+        4,
+        NULL);
+
 
 
     

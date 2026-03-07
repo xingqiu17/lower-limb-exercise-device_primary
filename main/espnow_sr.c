@@ -134,6 +134,84 @@ static bool all_slaves_ready(void)
 }
 
 
+esp_err_t master_send_action_to_ready_slaves(uint32_t action_code)
+{
+    espnow_frame_head_t frame_head = {};
+    frame_head.retransmit_count = 5;
+    frame_head.broadcast = false;
+
+    esp_now_data cmd = {
+        .type = STATUS_CHANGE,
+        .seq = seq++,
+        .data = action_code,
+    };
+
+    uint8_t sent_count = 0;
+    esp_err_t last_err = ESP_OK;
+
+    for (int i = 0; i < MAX_SLAVES; i++) {
+        if (!g_slave_macs[i].valid || !g_slave_macs[i].ready) {
+            continue;
+        }
+
+        esp_err_t err = espnow_send(ESPNOW_DATA_TYPE_DATA,
+                                    g_slave_macs[i].mac,
+                                    &cmd,
+                                    sizeof(cmd),
+                                    &frame_head,
+                                    portMAX_DELAY);
+
+        if (err == ESP_OK) {
+            sent_count++;
+            ESP_LOGI(TAG,
+                     "MASTER: send action=%lu to %02X:%02X:%02X:%02X:%02X:%02X",
+                     (unsigned long)action_code,
+                     g_slave_macs[i].mac[0], g_slave_macs[i].mac[1], g_slave_macs[i].mac[2],
+                     g_slave_macs[i].mac[3], g_slave_macs[i].mac[4], g_slave_macs[i].mac[5]);
+        } else {
+            last_err = err;
+            ESP_LOGE(TAG,
+                     "MASTER: failed action send to %02X:%02X:%02X:%02X:%02X:%02X, err=%s",
+                     g_slave_macs[i].mac[0], g_slave_macs[i].mac[1], g_slave_macs[i].mac[2],
+                     g_slave_macs[i].mac[3], g_slave_macs[i].mac[4], g_slave_macs[i].mac[5],
+                     esp_err_to_name(err));
+        }
+    }
+
+    if (sent_count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return last_err;
+}
+
+
+void master_action_verify_task(void *arg)
+{
+    (void)arg;
+
+    // Temporary fixed action value for validation on slave side.
+    const uint32_t verify_action = 1;
+
+    while (1) {
+        if (all_slaves_ready()) {
+            ESP_LOGI(TAG, "MASTER: all slaves ready, start action verify send");
+
+            esp_err_t err = master_send_action_to_ready_slaves(verify_action);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "MASTER: verify action send done, action=%lu", (unsigned long)verify_action);
+            } else {
+                ESP_LOGW(TAG, "MASTER: verify action send incomplete, err=%s", esp_err_to_name(err));
+            }
+
+            vTaskDelete(NULL);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+
 
 void ms_pairing_task(void *arg)
 {
@@ -270,8 +348,22 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
                                        size_t size,
                                        wifi_pkt_rx_ctrl_t *rx_ctrl)
 {
-  //static uint32_t count = 0;
-  const esp_now_data *pkt = (const esp_now_data *)data;
+    //static uint32_t count = 0;
+    if (!data || size < sizeof(esp_now_data)) {
+        ESP_LOGW(TAGR, "Drop invalid packet: size=%u", (unsigned)size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const esp_now_data *pkt = (const esp_now_data *)data;
+
+    ESP_LOGI(TAGR,
+                     "recv type=%d seq=%lu src=%02X:%02X:%02X:%02X:%02X:%02X ch=%d len=%u",
+                     pkt->type,
+                     (unsigned long)pkt->seq,
+                     src_addr[0], src_addr[1], src_addr[2],
+                     src_addr[3], src_addr[4], src_addr[5],
+                     rx_ctrl ? rx_ctrl->channel : -1,
+                     (unsigned)size);
 
   switch(pkt->type){
 
@@ -284,7 +376,9 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
           .data  = pkt->data
         };
         memcpy(msg.slave_mac, src_addr, 6);
-        xQueueSend(master_evt_queue, &msg, 0);
+                if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
+                        ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_CONFIRM");
+                }
 
 
     }break;
@@ -299,7 +393,9 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
           .data  = pkt->data
         };
         memcpy(msg.slave_mac, src_addr, 6);
-        xQueueSend(master_evt_queue, &msg, 0);
+        if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
+            ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_STATUS");
+        }
       
 
     }break;
@@ -314,7 +410,9 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
           .data  = pkt->data
         };
         memcpy(msg.slave_mac, src_addr, 6);
-        xQueueSend(master_evt_queue, &msg, 0);
+                if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
+                        ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_EXERCISE_DATA");
+                }
       
 
     }break;

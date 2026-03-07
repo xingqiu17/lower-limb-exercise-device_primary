@@ -91,13 +91,13 @@ esp_err_t app_uart_write_handle(uint8_t *src_addr, void *data,
 
 esp_err_t master_receive_handle(uint8_t *src_addr,void *data,size_t size,wifi_pkt_rx_ctrl_t *rx_ctrl);
 
-static int find_slave_mac(const uint8_t *mac);
-
-static bool mark_slave_ready(const uint8_t *mac);
-
-static bool all_slaves_ready(void);
-
 esp_err_t nvs_save_slave_mac(const uint8_t *mac);
+
+// Send STATUS_CHANGE action command to all READY slaves.
+esp_err_t master_send_action_to_ready_slaves(uint32_t action_code);
+
+// Wait for pairing completion and send one verification action command.
+void master_action_verify_task(void *arg);
 
 
 #ifdef __cplusplus
