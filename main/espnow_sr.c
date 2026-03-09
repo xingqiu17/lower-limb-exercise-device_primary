@@ -387,7 +387,7 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
     //接收从设备的状态确认
     case STATUS_CONFIRM:{
 
-        ESP_LOGI(TAGR,"Recevice Slave Status");
+        ESP_LOGI(TAGR,"Recevice Slave Status %lu", (unsigned long)pkt->data);
         master_evt_msg_t msg = {
           .event = EVT_SLAVE_STATUS,
           .data  = pkt->data
