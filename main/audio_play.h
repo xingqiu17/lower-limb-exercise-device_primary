@@ -13,15 +13,19 @@ extern "C" {
 #endif
 
 #define AUDIO_PLAY_LOGICAL_IO_NUM 8
+#define AUDIO_PLAY_BUTTON_NUM 4
 
 typedef enum {
 	AUDIO_PLAY_EVENT_BUSY_RISING = 0,
+	AUDIO_PLAY_EVENT_BUTTON_PRESSED,
 } audio_play_event_type_t;
 
 typedef struct {
 	audio_play_event_type_t type;
 	int busy_level;
 	uint32_t tick;
+	uint8_t button_index;
+	uint8_t logical_io;
 } audio_play_event_t;
 
 esp_err_t audio_play_init(void);
