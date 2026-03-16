@@ -15,12 +15,12 @@ extern "C" {
 #define AUDIO_PLAY_LOGICAL_IO_NUM 8
 
 typedef enum {
-	AUDIO_PLAY_EVENT_IO8_RISING = 0,
+	AUDIO_PLAY_EVENT_BUSY_RISING = 0,
 } audio_play_event_type_t;
 
 typedef struct {
 	audio_play_event_type_t type;
-	int io8_level;
+	int busy_level;
 	uint32_t tick;
 } audio_play_event_t;
 

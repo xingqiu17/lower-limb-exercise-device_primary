@@ -6,7 +6,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 
-#define AUDIO_PLAY_MONITOR_GPIO        GPIO_NUM_18
+#define AUDIO_PLAY_MONITOR_GPIO        GPIO_NUM_8
 #define AUDIO_PLAY_EVENT_QUEUE_LEN     8
 #define AUDIO_PLAY_MONITOR_TASK_STACK  2048
 #define AUDIO_PLAY_MONITOR_TASK_PRIO   4
@@ -22,8 +22,8 @@ static const gpio_num_t s_output_gpio_map[AUDIO_PLAY_LOGICAL_IO_NUM] = {
 	GPIO_NUM_11,
 	GPIO_NUM_10,
 	GPIO_NUM_9,
+	GPIO_NUM_46,
 	GPIO_NUM_3,
-	GPIO_NUM_8,
 };
 
 static QueueHandle_t s_event_queue = NULL;
@@ -35,7 +35,7 @@ static bool audio_play_is_valid_logical_io(uint8_t logical_io)
 	return logical_io < AUDIO_PLAY_LOGICAL_IO_NUM;
 }
 
-static void audio_play_io8_monitor_task(void *arg)
+static void audio_play_busy_monitor_task(void *arg)
 {
 	int previous_level = gpio_get_level(AUDIO_PLAY_MONITOR_GPIO);
 
@@ -44,12 +44,12 @@ static void audio_play_io8_monitor_task(void *arg)
 
 		if ((previous_level == 0) && (current_level == 1) && (s_event_queue != NULL)) {
 			audio_play_event_t evt = {
-				.type = AUDIO_PLAY_EVENT_IO8_RISING,
-				.io8_level = current_level,
+				.type = AUDIO_PLAY_EVENT_BUSY_RISING,
+				.busy_level = current_level,
 				.tick = xTaskGetTickCount(),
 			};
 			if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
-				ESP_LOGW(TAG, "event queue full, drop IO8 rising event");
+				ESP_LOGW(TAG, "event queue full, drop BUSY rising event");
 			}
 		}
 
@@ -135,7 +135,7 @@ esp_err_t audio_play_init(void)
 		.pull_down_en = GPIO_PULLDOWN_DISABLE,
 		.intr_type = GPIO_INTR_DISABLE,
 	};
-	ESP_RETURN_ON_ERROR(gpio_config(&input_cfg), TAG, "config IO8 input failed");
+	ESP_RETURN_ON_ERROR(gpio_config(&input_cfg), TAG, "config BUSY input failed");
 
 	uint64_t output_mask = 0;
 	for (uint8_t i = 0; i < AUDIO_PLAY_LOGICAL_IO_NUM; ++i) {
@@ -158,8 +158,8 @@ esp_err_t audio_play_init(void)
 	s_event_queue = xQueueCreate(AUDIO_PLAY_EVENT_QUEUE_LEN, sizeof(audio_play_event_t));
 	ESP_RETURN_ON_FALSE(s_event_queue != NULL, ESP_ERR_NO_MEM, TAG, "create event queue failed");
 
-	BaseType_t task_ok = xTaskCreate(audio_play_io8_monitor_task,
-									 "io8_monitor",
+	BaseType_t task_ok = xTaskCreate(audio_play_busy_monitor_task,
+									 "busy_monitor",
 									 AUDIO_PLAY_MONITOR_TASK_STACK,
 									 NULL,
 									 AUDIO_PLAY_MONITOR_TASK_PRIO,
@@ -167,7 +167,7 @@ esp_err_t audio_play_init(void)
 	ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create monitor task failed");
 
 	s_is_initialized = true;
-	ESP_LOGI(TAG, "audio_play init done, monitor IO8 and map IO0-7 to GPIO 14/13/12/11/10/9/46/3");
+	ESP_LOGI(TAG, "audio_play init done, monitor BUSY and map IO0-7 to GPIO 14/13/12/11/10/9/46/3");
 
 	return ESP_OK;
 }
