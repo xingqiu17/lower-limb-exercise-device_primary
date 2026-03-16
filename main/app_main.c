@@ -25,6 +25,7 @@
 #include "espnow_utils.h"
 
 #include "audio_play.h"
+#include "neopixel_ctrl.h"
 
 #include "espnow_sr.h"
 #include "state_machine.h"
@@ -37,6 +38,23 @@ static const char *TAG = "app_main";
 
 master_state_t m_state = MASTER_IDLE;
 slave_state_t s_state[2] = {SLAVE_IDLE,SLAVE_IDLE};
+
+
+static esp_err_t app_set_led_color_by_button(uint8_t button_index)
+{
+    switch (button_index) {
+        case 1:
+            return neopixel_ctrl_set_all_rgb(255, 0, 0);
+        case 2:
+            return neopixel_ctrl_set_all_rgb(0, 255, 0);
+        case 3:
+            return neopixel_ctrl_set_all_rgb(0, 0, 255);
+        case 4:
+            return neopixel_ctrl_set_all_rgb(255, 255, 255);
+        default:
+            return ESP_ERR_INVALID_ARG;
+    }
+}
 
 
 
@@ -66,6 +84,11 @@ static void audio_play_event_task(void *arg)
             if (logical_io >= APP_TRACK_COUNT) {
                 ESP_LOGW(TAG, "ignore invalid button event: button=%u logical_io=%u", evt.button_index, logical_io);
                 continue;
+            }
+
+            esp_err_t led_ret = app_set_led_color_by_button(evt.button_index);
+            if (led_ret != ESP_OK) {
+                ESP_LOGW(TAG, "set led color failed for button%u: %s", evt.button_index, esp_err_to_name(led_ret));
             }
 
             if (auto_play_active) {
@@ -158,6 +181,8 @@ static void app_wifi_init()
 void app_main()
 {
     espnow_storage_init();
+
+    ESP_ERROR_CHECK(neopixel_ctrl_init());
 
     ESP_ERROR_CHECK(audio_play_init());
 
