@@ -23,6 +23,9 @@ extern "C" {
 
 extern uint32_t seq ;
 
+extern uint32_t g_current_action_mode;
+extern uint32_t g_current_action_count;
+
 
 //测试用，实际切换为2 TODO
 //待修改
@@ -93,11 +96,12 @@ esp_err_t master_receive_handle(uint8_t *src_addr,void *data,size_t size,wifi_pk
 
 esp_err_t nvs_save_slave_mac(const uint8_t *mac);
 
+// Update current action mode (0: none, 1-4: action), and reset action count.
+void master_set_current_action_mode(uint32_t action_mode);
+
 // Send STATUS_CHANGE action command to all READY slaves.
 esp_err_t master_send_action_to_ready_slaves(uint32_t action_code);
 
-// Wait for pairing completion and send one verification action command.
-void master_action_verify_task(void *arg);
 
 
 #ifdef __cplusplus

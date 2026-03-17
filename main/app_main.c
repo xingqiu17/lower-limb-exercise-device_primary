@@ -57,6 +57,37 @@ static esp_err_t app_set_led_color_by_button(uint8_t button_index)
 }
 
 
+static esp_err_t app_sync_action_and_play(uint8_t logical_io)
+{
+    if (logical_io >= APP_TRACK_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t action_mode = (uint32_t)logical_io + 1U;
+    master_set_current_action_mode(action_mode);
+
+    esp_err_t send_ret = master_send_action_to_ready_slaves(action_mode);
+    if (send_ret != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "MASTER: send action=%lu incomplete, err=%s",
+                 (unsigned long)action_mode,
+                 esp_err_to_name(send_ret));
+    }
+
+    esp_err_t trigger_ret = audio_play_trigger_once(logical_io, APP_TRIGGER_LOW_TIME_MS);
+    if (trigger_ret != ESP_OK) {
+        master_set_current_action_mode(0);
+        return trigger_ret;
+    }
+
+    ESP_LOGI(TAG,
+             "sync action+music ok, action=%lu, IO%u",
+             (unsigned long)action_mode,
+             (unsigned)logical_io);
+    return ESP_OK;
+}
+
+
 
 static void audio_play_event_task(void *arg)
 {
@@ -96,9 +127,9 @@ static void audio_play_event_task(void *arg)
                 continue;
             }
 
-            esp_err_t trigger_ret = audio_play_trigger_once(logical_io, APP_TRIGGER_LOW_TIME_MS);
-            if (trigger_ret != ESP_OK) {
-                ESP_LOGE(TAG, "button%u trigger IO%u failed: %s", evt.button_index, logical_io, esp_err_to_name(trigger_ret));
+            esp_err_t play_ret = app_sync_action_and_play(logical_io);
+            if (play_ret != ESP_OK) {
+                ESP_LOGE(TAG, "button%u sync action+play IO%u failed: %s", evt.button_index, logical_io, esp_err_to_name(play_ret));
                 continue;
             }
 
@@ -120,6 +151,7 @@ static void audio_play_event_task(void *arg)
 
             if (played_track_mask == APP_TRACK_PLAYED_MASK_ALL) {
                 ESP_LOGI(TAG, "auto-play done after first button%u, clear recorded button and stop", first_pressed_button);
+                master_set_current_action_mode(0);
                 auto_play_active = false;
                 played_track_mask = 0;
                 current_track = -1;
@@ -138,6 +170,7 @@ static void audio_play_event_task(void *arg)
 
             if (next_track < 0) {
                 ESP_LOGW(TAG, "no next track found, clear auto-play state");
+                master_set_current_action_mode(0);
                 auto_play_active = false;
                 played_track_mask = 0;
                 current_track = -1;
@@ -145,9 +178,14 @@ static void audio_play_event_task(void *arg)
                 continue;
             }
 
-            esp_err_t trigger_ret = audio_play_trigger_once((uint8_t)next_track, APP_TRIGGER_LOW_TIME_MS);
-            if (trigger_ret != ESP_OK) {
-                ESP_LOGE(TAG, "auto-play trigger IO%u failed: %s", (uint8_t)next_track, esp_err_to_name(trigger_ret));
+            esp_err_t play_ret = app_sync_action_and_play((uint8_t)next_track);
+            if (play_ret != ESP_OK) {
+                ESP_LOGE(TAG, "auto-play sync action+play IO%u failed: %s", (uint8_t)next_track, esp_err_to_name(play_ret));
+                master_set_current_action_mode(0);
+                auto_play_active = false;
+                played_track_mask = 0;
+                current_track = -1;
+                first_pressed_button = -1;
                 continue;
             }
 
@@ -193,41 +231,36 @@ void app_main()
     
     master_evt_queue = xQueueCreate(8, sizeof(master_evt_msg_t));
 
-    //ESP_ERROR_CHECK(audio_play_set_io_mask(0xFF));
+    ESP_ERROR_CHECK(audio_play_set_io_mask(0xFF));
 
 
-    // vTaskDelay(pdMS_TO_TICKS(2000));
+
 
     
-    // esp_err_t ret = audio_play_trigger_once(0, 100);
-    // if (ret == ESP_OK) {
-    //     ESP_LOGI(TAG, "trigger music IO%u ok", 0);
-    // } else {
-    //     ESP_LOGE(TAG, "trigger music IO%u failed: %s", 0, esp_err_to_name(ret));
-    // }
+    esp_err_t ret = audio_play_trigger_once(0, 100);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "trigger music IO%u ok", 0);
+    } else {
+        ESP_LOGE(TAG, "trigger music IO%u failed: %s", 0, esp_err_to_name(ret));
+    }
 
-    //     vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
 
-    // espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle);
-    // //初始化完成，开始配对
+    espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle);
+    //初始化完成，开始配对
 
-    // xTaskCreate(ms_pairing_task,
-    //         "ms_pairing",
-    //         4096,
-    //         NULL,
-    //         4,
-    //         NULL);
+    xTaskCreate(ms_pairing_task,
+            "ms_pairing",
+            4096,
+            NULL,
+            4,
+            NULL);
 
-    // xTaskCreate(master_action_verify_task,
-    //     "action_verify",
-    //     4096,
-    //     NULL,
-    //     4,
-    //     NULL);
+
 
     xTaskCreate(audio_play_event_task,
         "audio_evt",
-        2048,
+        4096,
         NULL,
         3,
         NULL);

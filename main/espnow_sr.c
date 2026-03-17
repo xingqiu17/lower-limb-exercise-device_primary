@@ -11,6 +11,9 @@ static const char *TAG  = "esp_now";
 
 uint32_t seq = 0;
 
+uint32_t g_current_action_mode = 0;
+uint32_t g_current_action_count = 0;
+
 
 
 
@@ -21,6 +24,19 @@ slave_mac_info_t g_slave_macs[MAX_SLAVES] = {0};
 uint8_t g_slave_count = 0;
 
 QueueHandle_t master_evt_queue = NULL;
+
+void master_set_current_action_mode(uint32_t action_mode)
+{
+    if (action_mode > 4) {
+        ESP_LOGW(TAG, "Invalid action mode: %lu", (unsigned long)action_mode);
+        return;
+    }
+
+    g_current_action_mode = action_mode;
+    g_current_action_count = 0;
+
+    ESP_LOGI(TAG, "Set current action mode=%lu, count reset", (unsigned long)g_current_action_mode);
+}
 
 
 static int find_slave_mac(const uint8_t *mac)
@@ -186,30 +202,6 @@ esp_err_t master_send_action_to_ready_slaves(uint32_t action_code)
 }
 
 
-void master_action_verify_task(void *arg)
-{
-    (void)arg;
-
-    // Temporary fixed action value for validation on slave side.
-    const uint32_t verify_action = 1;
-
-    while (1) {
-        if (all_slaves_ready()) {
-            ESP_LOGI(TAG, "MASTER: all slaves ready, start action verify send");
-
-            esp_err_t err = master_send_action_to_ready_slaves(verify_action);
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "MASTER: verify action send done, action=%lu", (unsigned long)verify_action);
-            } else {
-                ESP_LOGW(TAG, "MASTER: verify action send incomplete, err=%s", esp_err_to_name(err));
-            }
-
-            vTaskDelete(NULL);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-}
 
 
 
@@ -403,6 +395,16 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
 
     //接收从设备如计步等运动数据（暂未详细定义）
     case EXERCISE_DATA:{
+
+        uint32_t mode = pkt->data;
+
+        if (mode == g_current_action_mode && mode >= 1 && mode <= 4) {
+            g_current_action_count++;
+            ESP_LOGI(TAGR,
+                     "Exercise matched: mode=%lu, count=%lu",
+                     (unsigned long)mode,
+                     (unsigned long)g_current_action_count);
+        }
 
         ESP_LOGI(TAGR,"Recevice Slave Exercise Data");
         master_evt_msg_t msg = {
