@@ -4,6 +4,7 @@
 #include "state_machine.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "neopixel_ctrl.h"
 
 static const char *TAGR = "receive_handle";
 
@@ -13,6 +14,7 @@ uint32_t seq = 0;
 
 uint32_t g_current_action_mode = 0;
 uint32_t g_current_action_count = 0;
+static bool g_pairing_event_accepting = true;
 
 
 
@@ -34,6 +36,11 @@ void master_set_current_action_mode(uint32_t action_mode)
 
     g_current_action_mode = action_mode;
     g_current_action_count = 0;
+
+    esp_err_t led_ret = neopixel_ctrl_set_gpio1_progress_red(0);
+    if (led_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Reset GPIO1 progress LED failed: %s", esp_err_to_name(led_ret));
+    }
 
     ESP_LOGI(TAG, "Set current action mode=%lu, count reset", (unsigned long)g_current_action_mode);
 }
@@ -217,6 +224,7 @@ void ms_pairing_task(void *arg)
     TickType_t last_send_tick = 0;
 
     /* 启动配对 */
+    g_pairing_event_accepting = true;
     state = MASTER_PAIRING;
     ESP_LOGI(TAG, "MASTER: start pairing");
 
@@ -315,6 +323,10 @@ void ms_pairing_task(void *arg)
 
         case MASTER_READY:
             ESP_LOGI(TAG, "MASTER: pairing done, enter READY");
+            g_pairing_event_accepting = false;
+            if (master_evt_queue != NULL) {
+                xQueueReset(master_evt_queue);
+            }
             vTaskDelete(NULL);
             break;
 
@@ -363,13 +375,15 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
     case CONNECTION_SLAVE_CONFIRM:{
 
         ESP_LOGI(TAGR,"Recevice Slave Confirm");
-        master_evt_msg_t msg = {
-          .event = EVT_SLAVE_CONFIRM,
-          .data  = pkt->data
-        };
-        memcpy(msg.slave_mac, src_addr, 6);
-                if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
-                        ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_CONFIRM");
+                if (g_pairing_event_accepting && master_evt_queue != NULL) {
+                        master_evt_msg_t msg = {
+                            .event = EVT_SLAVE_CONFIRM,
+                            .data  = pkt->data
+                        };
+                        memcpy(msg.slave_mac, src_addr, 6);
+                        if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
+                                ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_CONFIRM");
+                        }
                 }
 
 
@@ -380,13 +394,15 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
     case STATUS_CONFIRM:{
 
         ESP_LOGI(TAGR,"Recevice Slave Status %lu", (unsigned long)pkt->data);
-        master_evt_msg_t msg = {
-          .event = EVT_SLAVE_STATUS,
-          .data  = pkt->data
-        };
-        memcpy(msg.slave_mac, src_addr, 6);
-        if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
-            ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_STATUS");
+                if (g_pairing_event_accepting && master_evt_queue != NULL) {
+                        master_evt_msg_t msg = {
+                            .event = EVT_SLAVE_STATUS,
+                            .data  = pkt->data
+                        };
+                        memcpy(msg.slave_mac, src_addr, 6);
+                        if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
+                                ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_STATUS");
+                        }
         }
       
 
@@ -400,6 +416,15 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
 
         if (mode == g_current_action_mode && mode >= 1 && mode <= 4) {
             g_current_action_count++;
+
+            esp_err_t led_ret = neopixel_ctrl_set_gpio1_progress_red((uint16_t)g_current_action_count);
+            if (led_ret != ESP_OK) {
+                ESP_LOGW(TAGR,
+                         "Update GPIO1 progress LED failed, count=%lu, err=%s",
+                         (unsigned long)g_current_action_count,
+                         esp_err_to_name(led_ret));
+            }
+
             ESP_LOGI(TAGR,
                      "Exercise matched: mode=%lu, count=%lu",
                      (unsigned long)mode,
@@ -407,14 +432,6 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
         }
 
         ESP_LOGI(TAGR,"Recevice Slave Exercise Data");
-        master_evt_msg_t msg = {
-          .event = EVT_SLAVE_EXERCISE_DATA,
-          .data  = pkt->data
-        };
-        memcpy(msg.slave_mac, src_addr, 6);
-                if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
-                        ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_EXERCISE_DATA");
-                }
       
 
     }break;

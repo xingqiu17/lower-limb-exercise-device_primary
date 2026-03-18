@@ -9,6 +9,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 
 #include "driver/gpio.h"
 
@@ -35,27 +36,123 @@ static const char *TAG = "app_main";
 #define APP_TRACK_COUNT            4
 #define APP_TRACK_PLAYED_MASK_ALL  ((1U << APP_TRACK_COUNT) - 1U)
 #define APP_TRIGGER_LOW_TIME_MS    100
+#define APP_GPIO2_START_DELAY_MS   5000
+#define APP_REST_TIME_MS           30000
+#define APP_PLAYS_PER_ACTION       2
 
 master_state_t m_state = MASTER_IDLE;
 slave_state_t s_state[2] = {SLAVE_IDLE,SLAVE_IDLE};
 
+static TimerHandle_t s_gpio2_start_delay_timer = NULL;
+static TimerHandle_t s_gpio2_toggle_timer = NULL;
+static bool s_action_running = false;
+static bool s_gpio2_is_red = true;
+static uint32_t s_gpio2_action_mode = 0;
+static bool s_gpio2_blink_enabled = false;
 
-static esp_err_t app_set_led_color_by_button(uint8_t button_index)
+static bool app_gpio2_get_phase_ms(uint32_t action_mode, bool red_phase, uint32_t *phase_ms)
 {
-    switch (button_index) {
-        case 1:
-            return neopixel_ctrl_set_all_rgb(255, 0, 0);
-        case 2:
-            return neopixel_ctrl_set_all_rgb(0, 255, 0);
-        case 3:
-            return neopixel_ctrl_set_all_rgb(0, 0, 255);
-        case 4:
-            return neopixel_ctrl_set_all_rgb(255, 255, 255);
-        default:
-            return ESP_ERR_INVALID_ARG;
+    if (phase_ms == NULL) {
+        return false;
     }
+
+    if (action_mode == 1) {
+        *phase_ms = 3500;
+        return true;
+    }
+
+    if (action_mode == 2) {
+        *phase_ms = red_phase ? 4000 : 1000;
+        return true;
+    }
+
+    return false;
 }
 
+static void app_gpio2_schedule_next_toggle(void)
+{
+    uint32_t phase_ms = 0;
+
+    if (!s_action_running || !s_gpio2_blink_enabled || s_gpio2_toggle_timer == NULL) {
+        return;
+    }
+
+    if (!app_gpio2_get_phase_ms(s_gpio2_action_mode, s_gpio2_is_red, &phase_ms)) {
+        return;
+    }
+
+    (void)xTimerChangePeriod(s_gpio2_toggle_timer, pdMS_TO_TICKS(phase_ms), 0);
+    (void)xTimerStart(s_gpio2_toggle_timer, 0);
+}
+
+static void app_gpio2_start_delay_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+
+    if (!s_action_running || !s_gpio2_blink_enabled) {
+        return;
+    }
+
+    s_gpio2_is_red = true;
+    (void)neopixel_ctrl_set_gpio2_all_rgb(255, 0, 0);
+    app_gpio2_schedule_next_toggle();
+}
+
+static void app_gpio2_toggle_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+
+    if (!s_action_running || !s_gpio2_blink_enabled) {
+        return;
+    }
+
+    s_gpio2_is_red = !s_gpio2_is_red;
+    if (s_gpio2_is_red) {
+        (void)neopixel_ctrl_set_gpio2_all_rgb(255, 0, 0);
+    } else {
+        (void)neopixel_ctrl_set_gpio2_all_rgb(0, 255, 0);
+    }
+
+    app_gpio2_schedule_next_toggle();
+}
+
+static void app_set_action_running(bool running, uint32_t action_mode)
+{
+    if (running) {
+        uint32_t phase_ms = 0;
+
+        s_action_running = true;
+        s_gpio2_action_mode = action_mode;
+        s_gpio2_is_red = true;
+        s_gpio2_blink_enabled = app_gpio2_get_phase_ms(action_mode, true, &phase_ms);
+
+        if (s_gpio2_start_delay_timer != NULL) {
+            (void)xTimerStop(s_gpio2_start_delay_timer, 0);
+        }
+        if (s_gpio2_toggle_timer != NULL) {
+            (void)xTimerStop(s_gpio2_toggle_timer, 0);
+        }
+
+        (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
+
+        if (s_gpio2_blink_enabled && s_gpio2_start_delay_timer != NULL) {
+            (void)xTimerStart(s_gpio2_start_delay_timer, 0);
+        }
+
+        return;
+    }
+
+    s_action_running = false;
+    s_gpio2_action_mode = 0;
+    s_gpio2_blink_enabled = false;
+    if (s_gpio2_start_delay_timer != NULL) {
+        (void)xTimerStop(s_gpio2_start_delay_timer, 0);
+    }
+    if (s_gpio2_toggle_timer != NULL) {
+        (void)xTimerStop(s_gpio2_toggle_timer, 0);
+    }
+    (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
+}
 
 static esp_err_t app_sync_action_and_play(uint8_t logical_io)
 {
@@ -87,15 +184,73 @@ static esp_err_t app_sync_action_and_play(uint8_t logical_io)
     return ESP_OK;
 }
 
+static esp_err_t app_start_action_flow(uint8_t logical_io)
+{
+    esp_err_t ret = app_sync_action_and_play(logical_io);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    app_set_action_running(true, (uint32_t)logical_io + 1U);
+    return ESP_OK;
+}
+
+static void app_stop_current_action_flow(void)
+{
+    esp_err_t stop_send_ret = master_send_action_to_ready_slaves(0);
+    if (stop_send_ret != ESP_OK) {
+        ESP_LOGW(TAG, "send stop action to slaves failed: %s", esp_err_to_name(stop_send_ret));
+    }
+
+    master_set_current_action_mode(0);
+    app_set_action_running(false, 0);
+}
+
+static int8_t app_find_next_action(uint8_t current_action_io, uint8_t completed_action_mask)
+{
+    for (uint8_t offset = 1; offset <= APP_TRACK_COUNT; ++offset) {
+        uint8_t candidate = (current_action_io + offset) % APP_TRACK_COUNT;
+        if ((completed_action_mask & (1U << candidate)) == 0U) {
+            return (int8_t)candidate;
+        }
+    }
+
+    return -1;
+}
+
+static void app_reset_sequence_state(bool *sequence_active,
+                                     bool *action_playing,
+                                     bool *resting,
+                                     uint8_t *completed_action_mask,
+                                     uint8_t *current_action_io,
+                                     uint8_t *current_action_round,
+                                     TickType_t *rest_until_tick,
+                                     int8_t *first_pressed_button)
+{
+    app_stop_current_action_flow();
+    *sequence_active = false;
+    *action_playing = false;
+    *resting = false;
+    *completed_action_mask = 0;
+    *current_action_io = 0;
+    *current_action_round = 0;
+    *rest_until_tick = 0;
+    *first_pressed_button = -1;
+}
+
 
 
 static void audio_play_event_task(void *arg)
 {
     QueueHandle_t evt_queue = audio_play_get_event_queue();
     audio_play_event_t evt;
-    bool auto_play_active = false;
-    uint8_t played_track_mask = 0;
-    int8_t current_track = -1;
+    bool sequence_active = false;
+    bool action_playing = false;
+    bool resting = false;
+    uint8_t completed_action_mask = 0;
+    uint8_t current_action_io = 0;
+    uint8_t current_action_round = 0;
+    TickType_t rest_until_tick = 0;
     int8_t first_pressed_button = -1;
 
     if (evt_queue == NULL) {
@@ -105,93 +260,127 @@ static void audio_play_event_task(void *arg)
     }
 
     while (true) {
-        if (xQueueReceive(evt_queue, &evt, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
+        if (xQueueReceive(evt_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (evt.type == AUDIO_PLAY_EVENT_BUTTON_PRESSED) {
+                uint8_t logical_io = evt.logical_io;
 
-        if (evt.type == AUDIO_PLAY_EVENT_BUTTON_PRESSED) {
-            uint8_t logical_io = evt.logical_io;
-
-            if (logical_io >= APP_TRACK_COUNT) {
-                ESP_LOGW(TAG, "ignore invalid button event: button=%u logical_io=%u", evt.button_index, logical_io);
-                continue;
-            }
-
-            esp_err_t led_ret = app_set_led_color_by_button(evt.button_index);
-            if (led_ret != ESP_OK) {
-                ESP_LOGW(TAG, "set led color failed for button%u: %s", evt.button_index, esp_err_to_name(led_ret));
-            }
-
-            if (auto_play_active) {
-                ESP_LOGI(TAG, "button%u ignored, music sequence is running", evt.button_index);
-                continue;
-            }
-
-            esp_err_t play_ret = app_sync_action_and_play(logical_io);
-            if (play_ret != ESP_OK) {
-                ESP_LOGE(TAG, "button%u sync action+play IO%u failed: %s", evt.button_index, logical_io, esp_err_to_name(play_ret));
-                continue;
-            }
-
-            auto_play_active = true;
-            played_track_mask = (1U << logical_io);
-            current_track = (int8_t)logical_io;
-            first_pressed_button = (int8_t)evt.button_index;
-
-            ESP_LOGI(TAG, "button%u pressed, trigger IO%u, start auto-play sequence", evt.button_index, logical_io);
-            continue;
-        }
-
-        if (evt.type == AUDIO_PLAY_EVENT_BUSY_RISING) {
-            ESP_LOGI(TAG, "recv BUSY rising event, tick=%lu", (unsigned long)evt.tick);
-
-            if (!auto_play_active || current_track < 0) {
-                continue;
-            }
-
-            if (played_track_mask == APP_TRACK_PLAYED_MASK_ALL) {
-                ESP_LOGI(TAG, "auto-play done after first button%u, clear recorded button and stop", first_pressed_button);
-                master_set_current_action_mode(0);
-                auto_play_active = false;
-                played_track_mask = 0;
-                current_track = -1;
-                first_pressed_button = -1;
-                continue;
-            }
-
-            int8_t next_track = -1;
-            for (uint8_t offset = 1; offset <= APP_TRACK_COUNT; ++offset) {
-                uint8_t candidate = ((uint8_t)current_track + offset) % APP_TRACK_COUNT;
-                if ((played_track_mask & (1U << candidate)) == 0) {
-                    next_track = (int8_t)candidate;
-                    break;
+                if (logical_io >= APP_TRACK_COUNT) {
+                    ESP_LOGW(TAG, "ignore invalid button event: button=%u logical_io=%u", evt.button_index, logical_io);
+                    continue;
                 }
-            }
 
-            if (next_track < 0) {
-                ESP_LOGW(TAG, "no next track found, clear auto-play state");
-                master_set_current_action_mode(0);
-                auto_play_active = false;
-                played_track_mask = 0;
-                current_track = -1;
-                first_pressed_button = -1;
+                if (sequence_active) {
+                    ESP_LOGI(TAG, "button%u ignored, sequence is running/resting", evt.button_index);
+                    continue;
+                }
+
+                sequence_active = true;
+                action_playing = false;
+                resting = false;
+                completed_action_mask = 0;
+                current_action_io = logical_io;
+                current_action_round = 0;
+                rest_until_tick = 0;
+                first_pressed_button = (int8_t)evt.button_index;
+
+                esp_err_t play_ret = app_start_action_flow(current_action_io);
+                if (play_ret != ESP_OK) {
+                    ESP_LOGE(TAG, "button%u start sequence IO%u failed: %s", evt.button_index, current_action_io, esp_err_to_name(play_ret));
+                    app_reset_sequence_state(&sequence_active,
+                                             &action_playing,
+                                             &resting,
+                                             &completed_action_mask,
+                                             &current_action_io,
+                                             &current_action_round,
+                                             &rest_until_tick,
+                                             &first_pressed_button);
+                    continue;
+                }
+
+                action_playing = true;
+                ESP_LOGI(TAG, "button%u pressed, start action%u round%u", evt.button_index, (unsigned)(current_action_io + 1U), (unsigned)(current_action_round + 1U));
                 continue;
             }
 
-            esp_err_t play_ret = app_sync_action_and_play((uint8_t)next_track);
-            if (play_ret != ESP_OK) {
-                ESP_LOGE(TAG, "auto-play sync action+play IO%u failed: %s", (uint8_t)next_track, esp_err_to_name(play_ret));
-                master_set_current_action_mode(0);
-                auto_play_active = false;
-                played_track_mask = 0;
-                current_track = -1;
-                first_pressed_button = -1;
-                continue;
-            }
+            if (evt.type == AUDIO_PLAY_EVENT_BUSY_RISING) {
+                ESP_LOGI(TAG, "recv BUSY rising event, tick=%lu", (unsigned long)evt.tick);
 
-            played_track_mask |= (1U << next_track);
-            current_track = next_track;
-            ESP_LOGI(TAG, "auto-play next IO%u, played_mask=0x%02X", (uint8_t)next_track, played_track_mask);
+                if (!sequence_active || !action_playing) {
+                    continue;
+                }
+
+                app_stop_current_action_flow();
+                action_playing = false;
+
+                if ((current_action_round + 1U) < APP_PLAYS_PER_ACTION) {
+                    current_action_round++;
+                    resting = true;
+                    rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
+                    ESP_LOGI(TAG, "action%u round%u done, rest %ums then repeat", (unsigned)(current_action_io + 1U), (unsigned)current_action_round, (unsigned)APP_REST_TIME_MS);
+                    continue;
+                }
+
+                completed_action_mask |= (1U << current_action_io);
+
+                if (completed_action_mask == APP_TRACK_PLAYED_MASK_ALL) {
+                    ESP_LOGI(TAG, "all actions done after button%u, stop sequence", (unsigned)first_pressed_button);
+                    app_reset_sequence_state(&sequence_active,
+                                             &action_playing,
+                                             &resting,
+                                             &completed_action_mask,
+                                             &current_action_io,
+                                             &current_action_round,
+                                             &rest_until_tick,
+                                             &first_pressed_button);
+                    continue;
+                }
+
+                int8_t next_action = app_find_next_action(current_action_io, completed_action_mask);
+                if (next_action < 0) {
+                    ESP_LOGW(TAG, "next action not found, stop sequence");
+                    app_reset_sequence_state(&sequence_active,
+                                             &action_playing,
+                                             &resting,
+                                             &completed_action_mask,
+                                             &current_action_io,
+                                             &current_action_round,
+                                             &rest_until_tick,
+                                             &first_pressed_button);
+                    continue;
+                }
+
+                current_action_io = (uint8_t)next_action;
+                current_action_round = 0;
+                resting = true;
+                rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
+                ESP_LOGI(TAG, "action switch to %u after rest %ums", (unsigned)(current_action_io + 1U), (unsigned)APP_REST_TIME_MS);
+            }
+        }
+
+        if (sequence_active && resting) {
+            TickType_t now = xTaskGetTickCount();
+            if ((int32_t)(now - rest_until_tick) >= 0) {
+                esp_err_t play_ret = app_start_action_flow(current_action_io);
+                if (play_ret != ESP_OK) {
+                    ESP_LOGE(TAG, "start action%u round%u after rest failed: %s",
+                             (unsigned)(current_action_io + 1U),
+                             (unsigned)(current_action_round + 1U),
+                             esp_err_to_name(play_ret));
+                    app_reset_sequence_state(&sequence_active,
+                                             &action_playing,
+                                             &resting,
+                                             &completed_action_mask,
+                                             &current_action_io,
+                                             &current_action_round,
+                                             &rest_until_tick,
+                                             &first_pressed_button);
+                    continue;
+                }
+
+                resting = false;
+                action_playing = true;
+                ESP_LOGI(TAG, "start action%u round%u after rest", (unsigned)(current_action_io + 1U), (unsigned)(current_action_round + 1U));
+            }
         }
     }
 }
@@ -221,6 +410,22 @@ void app_main()
     espnow_storage_init();
 
     ESP_ERROR_CHECK(neopixel_ctrl_init());
+    ESP_ERROR_CHECK(neopixel_ctrl_clear_all());
+    ESP_ERROR_CHECK(neopixel_ctrl_set_gpio1_progress_red(0));
+
+    s_gpio2_start_delay_timer = xTimerCreate("gpio2_delay_tmr",
+                                             pdMS_TO_TICKS(APP_GPIO2_START_DELAY_MS),
+                                             pdFALSE,
+                                             NULL,
+                                             app_gpio2_start_delay_timer_cb);
+    ESP_ERROR_CHECK(s_gpio2_start_delay_timer != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+
+    s_gpio2_toggle_timer = xTimerCreate("gpio2_color_tmr",
+                                        pdMS_TO_TICKS(1000),
+                                        pdFALSE,
+                                        NULL,
+                                        app_gpio2_toggle_timer_cb);
+    ESP_ERROR_CHECK(s_gpio2_toggle_timer != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK(audio_play_init());
 
@@ -232,19 +437,6 @@ void app_main()
     master_evt_queue = xQueueCreate(8, sizeof(master_evt_msg_t));
 
     ESP_ERROR_CHECK(audio_play_set_io_mask(0xFF));
-
-
-
-
-    
-    esp_err_t ret = audio_play_trigger_once(0, 100);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "trigger music IO%u ok", 0);
-    } else {
-        ESP_LOGE(TAG, "trigger music IO%u failed: %s", 0, esp_err_to_name(ret));
-    }
-
-        vTaskDelay(pdMS_TO_TICKS(5000));
 
     espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle);
     //初始化完成，开始配对
