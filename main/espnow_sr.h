@@ -27,9 +27,9 @@ extern uint32_t g_current_action_mode;
 extern uint32_t g_current_action_count;
 
 
-//测试用，实际切换为2 TODO
-//待修改
-#define MAX_SLAVES  1
+#define MAX_SLAVES  2
+//TODO 待修改
+
 
 extern QueueHandle_t master_evt_queue;    //主设备事件句柄
 
@@ -41,6 +41,7 @@ typedef enum {
     STATUS_CHANGE,               //主设备->从设备：状态切换
     STATUS_CONFIRM,              //从设备->主设备：状态确认
     EXERCISE_DATA,               //锻炼数据
+    KEEP_ALIVE,                 //从设备->主设备  心跳包
 
     TEST,                        //测试
 
@@ -87,6 +88,7 @@ typedef struct {
 
 /*----------------------设备配对任务----------------------*/
 void ms_pairing_task(void *arg);
+void master_keepalive_monitor_task(void *arg);
 
 esp_err_t app_uart_write_handle(uint8_t *src_addr, void *data,
                                        size_t size, wifi_pkt_rx_ctrl_t *rx_ctrl);

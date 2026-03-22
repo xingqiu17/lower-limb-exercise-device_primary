@@ -10,11 +10,17 @@ static const char *TAGR = "receive_handle";
 
 static const char *TAG  = "esp_now";
 
+#define KEEP_ALIVE_TIMEOUT_MS  6000
+#define KEEP_ALIVE_CHECK_MS     500
+
 uint32_t seq = 0;
 
 uint32_t g_current_action_mode = 0;
 uint32_t g_current_action_count = 0;
 static bool g_pairing_event_accepting = true;
+
+static TickType_t g_slave_last_keepalive_tick[MAX_SLAVES] = {0};
+static bool g_slave_keepalive_online[MAX_SLAVES] = {false};
 
 
 
@@ -154,6 +160,69 @@ static bool all_slaves_ready(void)
     }
 
     return (ready_cnt >= MAX_SLAVES);
+}
+
+static void update_slave_keepalive_tick(const uint8_t *mac)
+{
+    if (mac == NULL) {
+        return;
+    }
+
+    int idx = find_slave_mac(mac);
+
+    if (idx < 0) {
+        (void)nvs_save_slave_mac(mac);
+        idx = find_slave_mac(mac);
+        if (idx < 0) {
+            ESP_LOGW(TAG, "KEEP_ALIVE from unknown slave and no free slot");
+            return;
+        }
+    }
+
+    g_slave_last_keepalive_tick[idx] = xTaskGetTickCount();
+
+    if (!g_slave_keepalive_online[idx]) {
+        g_slave_keepalive_online[idx] = true;
+        ESP_LOGI(TAG,
+                 "Slave online by KEEP_ALIVE: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    if (!g_slave_macs[idx].ready) {
+        g_slave_macs[idx].ready = true;
+        ESP_LOGI(TAG,
+                 "Slave READY restored by KEEP_ALIVE: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+}
+
+void master_keepalive_monitor_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        TickType_t now = xTaskGetTickCount();
+
+        for (int i = 0; i < MAX_SLAVES; i++) {
+            if (!g_slave_macs[i].valid || !g_slave_keepalive_online[i]) {
+                continue;
+            }
+
+            TickType_t elapsed = now - g_slave_last_keepalive_tick[i];
+            if (elapsed >= pdMS_TO_TICKS(KEEP_ALIVE_TIMEOUT_MS)) {
+                g_slave_keepalive_online[i] = false;
+                g_slave_macs[i].ready = false;
+
+                ESP_LOGW(TAG,
+                         "Slave keepalive timeout (> %d ms): %02X:%02X:%02X:%02X:%02X:%02X, set NOT READY",
+                         KEEP_ALIVE_TIMEOUT_MS,
+                         g_slave_macs[i].mac[0], g_slave_macs[i].mac[1], g_slave_macs[i].mac[2],
+                         g_slave_macs[i].mac[3], g_slave_macs[i].mac[4], g_slave_macs[i].mac[5]);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(KEEP_ALIVE_CHECK_MS));
+    }
 }
 
 
@@ -433,6 +502,40 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
 
         ESP_LOGI(TAGR,"Recevice Slave Exercise Data");
       
+
+    }break;
+
+    case KEEP_ALIVE: {
+        if (pkt->data != 0) {
+            ESP_LOGI(TAGR, "Ignore KEEP_ALIVE ack from slave, data=%lu", (unsigned long)pkt->data);
+            break;
+        }
+
+        update_slave_keepalive_tick(src_addr);
+
+        esp_now_data ack = {
+            .type = KEEP_ALIVE,
+            .seq  = seq++,
+            .data = 1,
+        };
+
+        espnow_frame_head_t frame_head = {};
+        frame_head.retransmit_count = 3;
+        frame_head.broadcast = false;
+
+        esp_err_t ack_ret = espnow_send(ESPNOW_DATA_TYPE_DATA,
+                                        src_addr,
+                                        &ack,
+                                        sizeof(ack),
+                                        &frame_head,
+                                        portMAX_DELAY);
+        if (ack_ret != ESP_OK) {
+            ESP_LOGW(TAGR,
+                     "KEEP_ALIVE ack failed to %02X:%02X:%02X:%02X:%02X:%02X, err=%s",
+                     src_addr[0], src_addr[1], src_addr[2],
+                     src_addr[3], src_addr[4], src_addr[5],
+                     esp_err_to_name(ack_ret));
+        }
 
     }break;
 

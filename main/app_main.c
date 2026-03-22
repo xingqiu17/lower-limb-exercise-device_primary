@@ -448,6 +448,13 @@ void app_main()
             4,
             NULL);
 
+        xTaskCreate(master_keepalive_monitor_task,
+            "ms_keepalive",
+            3072,
+            NULL,
+            3,
+            NULL);
+
 
 
     xTaskCreate(audio_play_event_task,
