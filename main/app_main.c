@@ -33,12 +33,39 @@
 
 static const char *TAG = "app_main";
 
-#define APP_TRACK_COUNT            4
-#define APP_TRACK_PLAYED_MASK_ALL  ((1U << APP_TRACK_COUNT) - 1U)
+#define APP_MAX_PLAYABLE_MUSIC     255
+#define APP_ACTION_COUNT           4
 #define APP_TRIGGER_LOW_TIME_MS    100
+#define APP_PROMPT_DELAY_AFTER_STOP_MS 1000
 #define APP_GPIO2_START_DELAY_MS   5000
 #define APP_REST_TIME_MS           30000
 #define APP_PLAYS_PER_ACTION       2
+
+typedef struct {
+    uint16_t music_id;
+    uint8_t trigger_mask;
+} app_music_trigger_t;
+
+static const app_music_trigger_t s_music_trigger_table[] = {
+    {1, 0xFE},
+    {2, 0xFD},
+    {3, 0xFC},
+    {4, 0xFB},
+    {5, 0xFA},
+    {6, 0xF9},
+    {7, 0xF8},
+    {8, 0xF7},
+    {9, 0xF6},
+    {10, 0xF5},
+    {11, 0xF4},
+    {12, 0xF3},
+    {13, 0xF2},
+};
+
+#define APP_TRACK_COUNT ((uint8_t)(sizeof(s_music_trigger_table) / sizeof(s_music_trigger_table[0])))
+
+_Static_assert((sizeof(s_music_trigger_table) / sizeof(s_music_trigger_table[0])) <= APP_MAX_PLAYABLE_MUSIC,
+               "music trigger table supports up to 255 entries");
 
 master_state_t m_state = MASTER_IDLE;
 slave_state_t s_state[2] = {SLAVE_IDLE,SLAVE_IDLE};
@@ -49,6 +76,76 @@ static bool s_action_running = false;
 static bool s_gpio2_is_red = true;
 static uint32_t s_gpio2_action_mode = 0;
 static bool s_gpio2_blink_enabled = false;
+
+static const app_music_trigger_t *app_get_music_trigger(uint8_t track_index)
+{
+    if (track_index >= APP_TRACK_COUNT) {
+        return NULL;
+    }
+
+    return &s_music_trigger_table[track_index];
+}
+
+static uint16_t app_get_music_id(uint8_t track_index)
+{
+    const app_music_trigger_t *track = app_get_music_trigger(track_index);
+    if (track == NULL) {
+        return 0;
+    }
+
+    return track->music_id;
+}
+
+static int16_t app_find_track_index_by_music_id(uint16_t music_id)
+{
+    for (uint8_t i = 0; i < APP_TRACK_COUNT; ++i) {
+        if (s_music_trigger_table[i].music_id == music_id) {
+            return (int16_t)i;
+        }
+    }
+
+    return -1;
+}
+
+static uint16_t app_get_round_rest_prompt_music_id(uint16_t finished_action_music_id)
+{
+    if ((finished_action_music_id >= 1U) && (finished_action_music_id <= 4U)) {
+        return (uint16_t)(finished_action_music_id + 4U);
+    }
+
+    return 0;
+}
+
+static uint16_t app_get_action_finish_prompt_music_id(uint16_t finished_action_music_id)
+{
+    switch (finished_action_music_id) {
+    case 4:
+        return 5;
+    case 1:
+        return 6;
+    case 2:
+        return 7;
+    case 3:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+static esp_err_t app_play_music_by_id(uint16_t music_id)
+{
+    int16_t track_index = app_find_track_index_by_music_id(music_id);
+    if (track_index < 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    const app_music_trigger_t *track = app_get_music_trigger((uint8_t)track_index);
+    if (track == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return audio_play_trigger_mask_once(track->trigger_mask, APP_TRIGGER_LOW_TIME_MS);
+}
 
 static bool app_gpio2_get_phase_ms(uint32_t action_mode, bool red_phase, uint32_t *phase_ms)
 {
@@ -154,13 +251,14 @@ static void app_set_action_running(bool running, uint32_t action_mode)
     (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
 }
 
-static esp_err_t app_sync_action_and_play(uint8_t logical_io)
+static esp_err_t app_sync_action_and_play(uint8_t track_index)
 {
-    if (logical_io >= APP_TRACK_COUNT) {
+    const app_music_trigger_t *track = app_get_music_trigger(track_index);
+    if (track == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    uint32_t action_mode = (uint32_t)logical_io + 1U;
+    uint32_t action_mode = track->music_id;
     master_set_current_action_mode(action_mode);
 
     esp_err_t send_ret = master_send_action_to_ready_slaves(action_mode);
@@ -171,27 +269,33 @@ static esp_err_t app_sync_action_and_play(uint8_t logical_io)
                  esp_err_to_name(send_ret));
     }
 
-    esp_err_t trigger_ret = audio_play_trigger_once(logical_io, APP_TRIGGER_LOW_TIME_MS);
+    esp_err_t trigger_ret = audio_play_trigger_mask_once(track->trigger_mask, APP_TRIGGER_LOW_TIME_MS);
     if (trigger_ret != ESP_OK) {
         master_set_current_action_mode(0);
         return trigger_ret;
     }
 
     ESP_LOGI(TAG,
-             "sync action+music ok, action=%lu, IO%u",
-             (unsigned long)action_mode,
-             (unsigned)logical_io);
+             "sync action+music ok, music=%u, mask=0x%02X, action=%lu",
+             (unsigned)track->music_id,
+             (unsigned)track->trigger_mask,
+             (unsigned long)action_mode);
     return ESP_OK;
 }
 
-static esp_err_t app_start_action_flow(uint8_t logical_io)
+static esp_err_t app_start_action_flow(uint8_t track_index)
 {
-    esp_err_t ret = app_sync_action_and_play(logical_io);
+    const app_music_trigger_t *track = app_get_music_trigger(track_index);
+    if (track == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = app_sync_action_and_play(track_index);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    app_set_action_running(true, (uint32_t)logical_io + 1U);
+    app_set_action_running(true, track->music_id);
     return ESP_OK;
 }
 
@@ -206,22 +310,33 @@ static void app_stop_current_action_flow(void)
     app_set_action_running(false, 0);
 }
 
-static int8_t app_find_next_action(uint8_t current_action_io, uint8_t completed_action_mask)
+static int16_t app_find_next_action(uint8_t current_action_index, const bool *completed_track)
 {
-    for (uint8_t offset = 1; offset <= APP_TRACK_COUNT; ++offset) {
-        uint8_t candidate = (current_action_io + offset) % APP_TRACK_COUNT;
-        if ((completed_action_mask & (1U << candidate)) == 0U) {
-            return (int8_t)candidate;
+    for (uint8_t offset = 1; offset <= APP_ACTION_COUNT; ++offset) {
+        uint8_t candidate = (current_action_index + offset) % APP_ACTION_COUNT;
+        if (!completed_track[candidate]) {
+            return (int16_t)candidate;
         }
     }
 
     return -1;
 }
 
+static bool app_is_all_tracks_completed(const bool *completed_track)
+{
+    for (uint8_t i = 0; i < APP_ACTION_COUNT; ++i) {
+        if (!completed_track[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static void app_reset_sequence_state(bool *sequence_active,
                                      bool *action_playing,
                                      bool *resting,
-                                     uint8_t *completed_action_mask,
+                                     bool *completed_track,
                                      uint8_t *current_action_io,
                                      uint8_t *current_action_round,
                                      TickType_t *rest_until_tick,
@@ -231,7 +346,9 @@ static void app_reset_sequence_state(bool *sequence_active,
     *sequence_active = false;
     *action_playing = false;
     *resting = false;
-    *completed_action_mask = 0;
+    for (uint8_t i = 0; i < APP_ACTION_COUNT; ++i) {
+        completed_track[i] = false;
+    }
     *current_action_io = 0;
     *current_action_round = 0;
     *rest_until_tick = 0;
@@ -247,7 +364,7 @@ static void audio_play_event_task(void *arg)
     bool sequence_active = false;
     bool action_playing = false;
     bool resting = false;
-    uint8_t completed_action_mask = 0;
+    bool completed_track[APP_ACTION_COUNT] = {0};
     uint8_t current_action_io = 0;
     uint8_t current_action_round = 0;
     TickType_t rest_until_tick = 0;
@@ -264,7 +381,7 @@ static void audio_play_event_task(void *arg)
             if (evt.type == AUDIO_PLAY_EVENT_BUTTON_PRESSED) {
                 uint8_t logical_io = evt.logical_io;
 
-                if (logical_io >= APP_TRACK_COUNT) {
+                if (logical_io >= APP_ACTION_COUNT) {
                     ESP_LOGW(TAG, "ignore invalid button event: button=%u logical_io=%u", evt.button_index, logical_io);
                     continue;
                 }
@@ -277,7 +394,9 @@ static void audio_play_event_task(void *arg)
                 sequence_active = true;
                 action_playing = false;
                 resting = false;
-                completed_action_mask = 0;
+                for (uint8_t i = 0; i < APP_ACTION_COUNT; ++i) {
+                    completed_track[i] = false;
+                }
                 current_action_io = logical_io;
                 current_action_round = 0;
                 rest_until_tick = 0;
@@ -289,7 +408,7 @@ static void audio_play_event_task(void *arg)
                     app_reset_sequence_state(&sequence_active,
                                              &action_playing,
                                              &resting,
-                                             &completed_action_mask,
+                                             completed_track,
                                              &current_action_io,
                                              &current_action_round,
                                              &rest_until_tick,
@@ -298,7 +417,11 @@ static void audio_play_event_task(void *arg)
                 }
 
                 action_playing = true;
-                ESP_LOGI(TAG, "button%u pressed, start action%u round%u", evt.button_index, (unsigned)(current_action_io + 1U), (unsigned)(current_action_round + 1U));
+                ESP_LOGI(TAG,
+                         "button%u pressed, start music%u round%u",
+                         evt.button_index,
+                         (unsigned)app_get_music_id(current_action_io),
+                         (unsigned)(current_action_round + 1U));
                 continue;
             }
 
@@ -316,18 +439,42 @@ static void audio_play_event_task(void *arg)
                     current_action_round++;
                     resting = true;
                     rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
-                    ESP_LOGI(TAG, "action%u round%u done, rest %ums then repeat", (unsigned)(current_action_io + 1U), (unsigned)current_action_round, (unsigned)APP_REST_TIME_MS);
+
+                    uint16_t finished_action_music_id = app_get_music_id(current_action_io);
+                    uint16_t prompt_music_id = app_get_round_rest_prompt_music_id(finished_action_music_id);
+                    if (prompt_music_id != 0) {
+                        vTaskDelay(pdMS_TO_TICKS(APP_PROMPT_DELAY_AFTER_STOP_MS));
+                        esp_err_t prompt_ret = app_play_music_by_id(prompt_music_id);
+                        if (prompt_ret != ESP_OK) {
+                            ESP_LOGW(TAG,
+                                     "play rest prompt music%u failed after action%u round1: %s",
+                                     (unsigned)prompt_music_id,
+                                     (unsigned)finished_action_music_id,
+                                     esp_err_to_name(prompt_ret));
+                        } else {
+                            ESP_LOGI(TAG,
+                                     "play rest prompt music%u after action%u round1",
+                                     (unsigned)prompt_music_id,
+                                     (unsigned)finished_action_music_id);
+                        }
+                    }
+
+                    ESP_LOGI(TAG,
+                             "music%u round%u done, rest %ums then repeat",
+                             (unsigned)app_get_music_id(current_action_io),
+                             (unsigned)current_action_round,
+                             (unsigned)APP_REST_TIME_MS);
                     continue;
                 }
 
-                completed_action_mask |= (1U << current_action_io);
+                completed_track[current_action_io] = true;
 
-                if (completed_action_mask == APP_TRACK_PLAYED_MASK_ALL) {
+                if (app_is_all_tracks_completed(completed_track)) {
                     ESP_LOGI(TAG, "all actions done after button%u, stop sequence", (unsigned)first_pressed_button);
                     app_reset_sequence_state(&sequence_active,
                                              &action_playing,
                                              &resting,
-                                             &completed_action_mask,
+                                             completed_track,
                                              &current_action_io,
                                              &current_action_round,
                                              &rest_until_tick,
@@ -335,25 +482,44 @@ static void audio_play_event_task(void *arg)
                     continue;
                 }
 
-                int8_t next_action = app_find_next_action(current_action_io, completed_action_mask);
+                int16_t next_action = app_find_next_action(current_action_io, completed_track);
                 if (next_action < 0) {
                     ESP_LOGW(TAG, "next action not found, stop sequence");
                     app_reset_sequence_state(&sequence_active,
                                              &action_playing,
                                              &resting,
-                                             &completed_action_mask,
+                                             completed_track,
                                              &current_action_io,
                                              &current_action_round,
                                              &rest_until_tick,
                                              &first_pressed_button);
                     continue;
+                }
+
+                uint16_t finished_action_music_id = app_get_music_id(current_action_io);
+                uint16_t prompt_music_id = app_get_action_finish_prompt_music_id(finished_action_music_id);
+                if (prompt_music_id != 0) {
+                    vTaskDelay(pdMS_TO_TICKS(APP_PROMPT_DELAY_AFTER_STOP_MS));
+                    esp_err_t prompt_ret = app_play_music_by_id(prompt_music_id);
+                    if (prompt_ret != ESP_OK) {
+                        ESP_LOGW(TAG,
+                                 "play prepare prompt music%u failed after action%u: %s",
+                                 (unsigned)prompt_music_id,
+                                 (unsigned)finished_action_music_id,
+                                 esp_err_to_name(prompt_ret));
+                    } else {
+                        ESP_LOGI(TAG,
+                                 "play prepare prompt music%u after action%u",
+                                 (unsigned)prompt_music_id,
+                                 (unsigned)finished_action_music_id);
+                    }
                 }
 
                 current_action_io = (uint8_t)next_action;
                 current_action_round = 0;
                 resting = true;
                 rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
-                ESP_LOGI(TAG, "action switch to %u after rest %ums", (unsigned)(current_action_io + 1U), (unsigned)APP_REST_TIME_MS);
+                ESP_LOGI(TAG, "music switch to %u after rest %ums", (unsigned)app_get_music_id(current_action_io), (unsigned)APP_REST_TIME_MS);
             }
         }
 
@@ -369,7 +535,7 @@ static void audio_play_event_task(void *arg)
                     app_reset_sequence_state(&sequence_active,
                                              &action_playing,
                                              &resting,
-                                             &completed_action_mask,
+                                             completed_track,
                                              &current_action_io,
                                              &current_action_round,
                                              &rest_until_tick,
@@ -379,7 +545,10 @@ static void audio_play_event_task(void *arg)
 
                 resting = false;
                 action_playing = true;
-                ESP_LOGI(TAG, "start action%u round%u after rest", (unsigned)(current_action_io + 1U), (unsigned)(current_action_round + 1U));
+                ESP_LOGI(TAG,
+                         "start music%u round%u after rest",
+                         (unsigned)app_get_music_id(current_action_io),
+                         (unsigned)(current_action_round + 1U));
             }
         }
     }

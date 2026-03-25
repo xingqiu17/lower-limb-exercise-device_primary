@@ -40,6 +40,8 @@ esp_err_t audio_play_set_io_mask(uint8_t bit_mask);
 
 esp_err_t audio_play_trigger_once(uint8_t logical_io, uint32_t low_time_ms);
 
+esp_err_t audio_play_trigger_mask_once(uint8_t bit_mask, uint32_t low_time_ms);
+
 esp_err_t audio_play_get_physical_gpio(uint8_t logical_io, gpio_num_t *gpio_num);
 
 #ifdef __cplusplus

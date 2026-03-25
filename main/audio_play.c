@@ -139,15 +139,22 @@ esp_err_t audio_play_trigger_once(uint8_t logical_io, uint32_t low_time_ms)
 	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
 	ESP_RETURN_ON_FALSE(audio_play_is_valid_logical_io(logical_io), ESP_ERR_INVALID_ARG, TAG, "invalid logical_io");
 
-	gpio_num_t gpio = s_output_gpio_map[logical_io];
+	uint8_t bit_mask = (uint8_t)(0xFFU & (~(1U << logical_io)));
+	return audio_play_trigger_mask_once(bit_mask, low_time_ms);
+}
 
-	ESP_RETURN_ON_ERROR(gpio_set_level(gpio, 1), TAG, "set high before trigger failed");
+esp_err_t audio_play_trigger_mask_once(uint8_t bit_mask, uint32_t low_time_ms)
+{
+	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
+	ESP_RETURN_ON_FALSE(bit_mask != 0xFF, ESP_ERR_INVALID_ARG, TAG, "bit_mask must pull at least one IO low");
+
+	ESP_RETURN_ON_ERROR(audio_play_set_io_mask(0xFF), TAG, "set high before trigger failed");
 	vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAY_TRIGGER_PREPARE_MS));
 
-	ESP_RETURN_ON_ERROR(gpio_set_level(gpio, 0), TAG, "set low trigger failed");
+	ESP_RETURN_ON_ERROR(audio_play_set_io_mask(bit_mask), TAG, "set trigger mask failed");
 	vTaskDelay(pdMS_TO_TICKS(low_time_ms));
 
-	ESP_RETURN_ON_ERROR(gpio_set_level(gpio, 1), TAG, "restore high failed");
+	ESP_RETURN_ON_ERROR(audio_play_set_io_mask(0xFF), TAG, "restore high failed");
 	return ESP_OK;
 }
 

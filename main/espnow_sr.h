@@ -27,7 +27,7 @@ extern uint32_t g_current_action_mode;
 extern uint32_t g_current_action_count;
 
 
-#define MAX_SLAVES  2
+#define MAX_SLAVES  1
 //TODO 待修改
 
 
