@@ -40,6 +40,10 @@ static const char *TAG = "app_main";
 #define APP_GPIO2_START_DELAY_MS   5000
 #define APP_REST_TIME_MS           30000
 #define APP_PLAYS_PER_ACTION       2
+#define APP_ACTION3_RED_ON_MS      120
+#define APP_ACTION3_RED_OFF_MS     480
+#define APP_ACTION4_RED_ON_MS      150
+#define APP_ACTION4_RED_OFF_MS     600
 
 typedef struct {
     uint16_t music_id;
@@ -163,6 +167,16 @@ static bool app_gpio2_get_phase_ms(uint32_t action_mode, bool red_phase, uint32_
         return true;
     }
 
+    if (action_mode == 3) {
+        *phase_ms = red_phase ? APP_ACTION3_RED_ON_MS : APP_ACTION3_RED_OFF_MS;
+        return true;
+    }
+
+    if (action_mode == 4) {
+        *phase_ms = red_phase ? APP_ACTION4_RED_ON_MS : APP_ACTION4_RED_OFF_MS;
+        return true;
+    }
+
     return false;
 }
 
@@ -207,7 +221,11 @@ static void app_gpio2_toggle_timer_cb(TimerHandle_t timer)
     if (s_gpio2_is_red) {
         (void)neopixel_ctrl_set_gpio2_all_rgb(255, 0, 0);
     } else {
-        (void)neopixel_ctrl_set_gpio2_all_rgb(0, 255, 0);
+        if (s_gpio2_action_mode == 3 || s_gpio2_action_mode == 4) {
+            (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
+        } else {
+            (void)neopixel_ctrl_set_gpio2_all_rgb(0, 255, 0);
+        }
     }
 
     app_gpio2_schedule_next_toggle();
