@@ -42,6 +42,8 @@ typedef enum {
     STATUS_CONFIRM,              //从设备->主设备：状态确认
     EXERCISE_DATA,               //锻炼数据
     KEEP_ALIVE,                 //从设备->主设备  心跳包
+    POWER_MANAGE,               //电源管理：主->从 data=1开机/0关机；从->主 data=2确认
+    
 
     TEST,                        //测试
 
@@ -62,6 +64,7 @@ typedef enum {
     EVT_SLAVE_CONFIRM,         // 接收到从设备确认
     EVT_SLAVE_STATUS,          //接收到从设备状态确认
     EVT_SLAVE_EXERCISE_DATA,   //接收到从设备运动数据
+    EVT_SLAVE_POWER_ACK,       //接收到从设备电源管理确认（data=2）
     EVT_PAIR_ERROR,
 } master_pair_event_t;
 
@@ -103,6 +106,18 @@ void master_set_current_action_mode(uint32_t action_mode);
 
 // Send STATUS_CHANGE action command to all READY slaves.
 esp_err_t master_send_action_to_ready_slaves(uint32_t action_code);
+
+// Send POWER_MANAGE command to all READY slaves. power_data: 1=power on, 0=power off.
+esp_err_t master_send_power_manage_to_ready_slaves(uint32_t power_data);
+
+// Wait slave POWER_MANAGE ack (data=2) within timeout.
+bool master_wait_slave_power_ack(uint32_t timeout_ms);
+
+// Control whether master is in shutdown flow. When true, non-shutdown events should be ignored.
+void master_set_shutdown_in_progress(bool in_progress);
+
+// Query shutdown flow state.
+bool master_is_shutdown_in_progress(void);
 
 
 

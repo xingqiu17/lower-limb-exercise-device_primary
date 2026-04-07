@@ -18,6 +18,7 @@ uint32_t seq = 0;
 uint32_t g_current_action_mode = 0;
 uint32_t g_current_action_count = 0;
 static bool g_pairing_event_accepting = true;
+static volatile bool g_shutdown_in_progress = false;
 
 static TickType_t g_slave_last_keepalive_tick[MAX_SLAVES] = {0};
 static bool g_slave_keepalive_online[MAX_SLAVES] = {false};
@@ -32,6 +33,17 @@ slave_mac_info_t g_slave_macs[MAX_SLAVES] = {0};
 uint8_t g_slave_count = 0;
 
 QueueHandle_t master_evt_queue = NULL;
+
+void master_set_shutdown_in_progress(bool in_progress)
+{
+    g_shutdown_in_progress = in_progress;
+    ESP_LOGI(TAG, "shutdown_in_progress=%d", (int)g_shutdown_in_progress);
+}
+
+bool master_is_shutdown_in_progress(void)
+{
+    return g_shutdown_in_progress;
+}
 
 void master_set_current_action_mode(uint32_t action_mode)
 {
@@ -201,6 +213,11 @@ void master_keepalive_monitor_task(void *arg)
     (void)arg;
 
     while (1) {
+        if (g_shutdown_in_progress) {
+            vTaskDelay(pdMS_TO_TICKS(KEEP_ALIVE_CHECK_MS));
+            continue;
+        }
+
         TickType_t now = xTaskGetTickCount();
 
         for (int i = 0; i < MAX_SLAVES; i++) {
@@ -277,6 +294,95 @@ esp_err_t master_send_action_to_ready_slaves(uint32_t action_code)
     return last_err;
 }
 
+esp_err_t master_send_power_manage_to_ready_slaves(uint32_t power_data)
+{
+    if (power_data > 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    espnow_frame_head_t frame_head = {};
+    frame_head.retransmit_count = 5;
+    frame_head.broadcast = false;
+
+    esp_now_data cmd = {
+        .type = POWER_MANAGE,
+        .seq = seq++,
+        .data = power_data,
+    };
+
+    uint8_t sent_count = 0;
+    esp_err_t last_err = ESP_OK;
+
+    for (int i = 0; i < MAX_SLAVES; i++) {
+        if (!g_slave_macs[i].valid || !g_slave_macs[i].ready) {
+            continue;
+        }
+
+        esp_err_t err = espnow_send(ESPNOW_DATA_TYPE_DATA,
+                                    g_slave_macs[i].mac,
+                                    &cmd,
+                                    sizeof(cmd),
+                                    &frame_head,
+                                    portMAX_DELAY);
+
+        if (err == ESP_OK) {
+            sent_count++;
+            ESP_LOGI(TAG,
+                     "MASTER: send POWER_MANAGE=%lu to %02X:%02X:%02X:%02X:%02X:%02X",
+                     (unsigned long)power_data,
+                     g_slave_macs[i].mac[0], g_slave_macs[i].mac[1], g_slave_macs[i].mac[2],
+                     g_slave_macs[i].mac[3], g_slave_macs[i].mac[4], g_slave_macs[i].mac[5]);
+        } else {
+            last_err = err;
+            ESP_LOGE(TAG,
+                     "MASTER: failed POWER_MANAGE send to %02X:%02X:%02X:%02X:%02X:%02X, err=%s",
+                     g_slave_macs[i].mac[0], g_slave_macs[i].mac[1], g_slave_macs[i].mac[2],
+                     g_slave_macs[i].mac[3], g_slave_macs[i].mac[4], g_slave_macs[i].mac[5],
+                     esp_err_to_name(err));
+        }
+    }
+
+    if (sent_count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return last_err;
+}
+
+bool master_wait_slave_power_ack(uint32_t timeout_ms)
+{
+    if (master_evt_queue == NULL) {
+        return false;
+    }
+
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    master_evt_msg_t evt;
+
+    while (1) {
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(deadline - now) <= 0) {
+            break;
+        }
+
+        TickType_t remain = deadline - now;
+        TickType_t wait_ticks = remain > pdMS_TO_TICKS(50) ? pdMS_TO_TICKS(50) : remain;
+
+        if (xQueueReceive(master_evt_queue, &evt, wait_ticks) != pdTRUE) {
+            continue;
+        }
+
+        if ((evt.event == EVT_SLAVE_POWER_ACK) && (evt.data == 2)) {
+            ESP_LOGI(TAG,
+                     "MASTER: recv slave power ack from %02X:%02X:%02X:%02X:%02X:%02X",
+                     evt.slave_mac[0], evt.slave_mac[1], evt.slave_mac[2],
+                     evt.slave_mac[3], evt.slave_mac[4], evt.slave_mac[5]);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 
 
 
@@ -305,6 +411,22 @@ void ms_pairing_task(void *arg)
             /* 1. 周期性广播配对请求 */
             if (xTaskGetTickCount() - last_send_tick >
                 pdMS_TO_TICKS(1000)) {
+
+                // 先广播开机请求，确保从机被主机拉起（data=1）。
+                esp_now_data power_on_request = {
+                    .type = POWER_MANAGE,
+                    .seq  = seq++,
+                    .data = 1
+                };
+
+                espnow_send(ESPNOW_DATA_TYPE_DATA,
+                            ESPNOW_ADDR_BROADCAST,
+                            &power_on_request,
+                            sizeof(power_on_request),
+                            &frame_head,
+                            portMAX_DELAY);
+
+                ESP_LOGI(TAG, "MASTER: broadcast power on request");
 
                 esp_now_data pair_request = {
                     .type = CONNECTION_REQUEST,
@@ -438,7 +560,12 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
                      rx_ctrl ? rx_ctrl->channel : -1,
                      (unsigned)size);
 
-  switch(pkt->type){
+    if (g_shutdown_in_progress && pkt->type != POWER_MANAGE) {
+            ESP_LOGI(TAGR, "Ignore packet type=%d during shutdown", pkt->type);
+            return ESP_OK;
+    }
+
+    switch(pkt->type){
 
     //接收从设备配对确认
     case CONNECTION_SLAVE_CONFIRM:{
@@ -506,6 +633,11 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
     }break;
 
     case KEEP_ALIVE: {
+        if (g_shutdown_in_progress) {
+            ESP_LOGI(TAGR, "Ignore KEEP_ALIVE during shutdown");
+            break;
+        }
+
         if (pkt->data != 0) {
             ESP_LOGI(TAGR, "Ignore KEEP_ALIVE ack from slave, data=%lu", (unsigned long)pkt->data);
             break;
@@ -537,6 +669,22 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
                      esp_err_to_name(ack_ret));
         }
 
+    }break;
+
+    case POWER_MANAGE: {
+        // 从设备电源管理确认: data=2
+        if ((pkt->data == 2) && (master_evt_queue != NULL)) {
+            master_evt_msg_t msg = {
+                .event = EVT_SLAVE_POWER_ACK,
+                .data  = pkt->data
+            };
+            memcpy(msg.slave_mac, src_addr, 6);
+            if (xQueueSend(master_evt_queue, &msg, 0) != pdTRUE) {
+                ESP_LOGW(TAGR, "Queue full, drop EVT_SLAVE_POWER_ACK");
+            }
+        } else {
+            ESP_LOGI(TAGR, "Ignore POWER_MANAGE packet data=%lu", (unsigned long)pkt->data);
+        }
     }break;
 
 

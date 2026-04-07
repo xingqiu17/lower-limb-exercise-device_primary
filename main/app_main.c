@@ -51,6 +51,7 @@ static const char *TAG = "app_main";
 #define APP_POWER_KEY_SCAN_MS      20
 #define APP_POWER_KEY_MIN_MS       30
 #define APP_POWER_KEY_MAX_MS       1000
+#define APP_SLAVE_POWER_ACK_TIMEOUT_MS 1000
 
 typedef struct {
     uint16_t music_id;
@@ -97,6 +98,7 @@ static TaskHandle_t s_audio_evt_task_handle = NULL;
 
 static esp_err_t app_start_normal_services(void);
 static void app_stop_normal_services(void);
+static void app_stop_user_visible_output_now(void);
 
 static const app_music_trigger_t *app_get_music_trigger(uint8_t track_index)
 {
@@ -674,11 +676,27 @@ static void app_power_key_task(void *arg)
     }
 }
 
+static void app_stop_user_visible_output_now(void)
+{
+    // 用户触发关机后，先立刻停掉可见/可听输出，保证体感无延迟。
+    app_stop_current_action_flow();
+    esp_err_t stop_music_ret = audio_play_stop_playback();
+    if ((stop_music_ret != ESP_OK) && (stop_music_ret != ESP_ERR_INVALID_STATE)) {
+        ESP_LOGW(TAG, "stop music failed: %s", esp_err_to_name(stop_music_ret));
+    }
+
+    (void)audio_play_set_io_mask(0xFF);
+    (void)neopixel_ctrl_set_gpio1_progress_red(0);
+    (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
+}
+
 static esp_err_t app_start_normal_services(void)
 {
     if (s_normal_services_started) {
         return ESP_OK;
     }
+
+    master_set_shutdown_in_progress(false);
 
     ESP_RETURN_ON_ERROR(app_wifi_init(), TAG, "wifi init/start failed");
 
@@ -720,6 +738,13 @@ static esp_err_t app_start_normal_services(void)
     }
 
     s_normal_services_started = true;
+
+    // 主机开机后，向已就绪从机广播开机语义（data=1）。
+    esp_err_t pwr_on_ret = master_send_power_manage_to_ready_slaves(1);
+    if ((pwr_on_ret != ESP_OK) && (pwr_on_ret != ESP_ERR_NOT_FOUND)) {
+        ESP_LOGW(TAG, "send slave power on cmd failed: %s", esp_err_to_name(pwr_on_ret));
+    }
+
     ESP_LOGI(TAG, "device power on: normal services started");
     return ESP_OK;
 }
@@ -816,7 +841,25 @@ void app_main()
                     ESP_LOGE(TAG, "power on failed: %s", esp_err_to_name(start_ret));
                 }
             } else {
+                master_set_shutdown_in_progress(true);
+
+                // 1) 用户可见输出立即停止（零体感延迟）
+                app_stop_user_visible_output_now();
                 s_device_power_on = false;
+
+                // 2) 主机向从机发关机指令（data=0），并等待从机确认（data=2）
+                esp_err_t pwr_off_send_ret = master_send_power_manage_to_ready_slaves(0);
+                bool got_ack = false;
+                if (pwr_off_send_ret == ESP_OK) {
+                    got_ack = master_wait_slave_power_ack(APP_SLAVE_POWER_ACK_TIMEOUT_MS);
+                } else if (pwr_off_send_ret != ESP_ERR_NOT_FOUND) {
+                    ESP_LOGW(TAG, "send slave power off cmd failed: %s", esp_err_to_name(pwr_off_send_ret));
+                }
+
+                if (!got_ack) {
+                    ESP_LOGW(TAG, "slave power off ack timeout, continue local shutdown");
+                }
+
                 app_stop_normal_services();
             }
         }
