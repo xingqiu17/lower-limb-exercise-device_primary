@@ -8,12 +8,15 @@
 */
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 
 #include "driver/gpio.h"
 
 #include "esp_log.h"
+#include "esp_check.h"
+#include "esp_event.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 
@@ -44,6 +47,10 @@ static const char *TAG = "app_main";
 #define APP_ACTION3_RED_OFF_MS     480
 #define APP_ACTION4_RED_ON_MS      150
 #define APP_ACTION4_RED_OFF_MS     600
+#define APP_POWER_KEY_GPIO         GPIO_NUM_13
+#define APP_POWER_KEY_SCAN_MS      20
+#define APP_POWER_KEY_MIN_MS       30
+#define APP_POWER_KEY_MAX_MS       1000
 
 typedef struct {
     uint16_t music_id;
@@ -80,6 +87,16 @@ static bool s_action_running = false;
 static bool s_gpio2_is_red = true;
 static uint32_t s_gpio2_action_mode = 0;
 static bool s_gpio2_blink_enabled = false;
+static volatile bool s_device_power_on = false;
+static bool s_normal_services_started = false;
+static bool s_wifi_driver_inited = false;
+static bool s_event_loop_inited = false;
+static QueueHandle_t s_power_key_evt_queue = NULL;
+static TaskHandle_t s_keepalive_task_handle = NULL;
+static TaskHandle_t s_audio_evt_task_handle = NULL;
+
+static esp_err_t app_start_normal_services(void);
+static void app_stop_normal_services(void);
 
 static const app_music_trigger_t *app_get_music_trigger(uint8_t track_index)
 {
@@ -395,6 +412,25 @@ static void audio_play_event_task(void *arg)
     }
 
     while (true) {
+        // 关机态只做事件清理，不执行业务流程。
+        if (!s_device_power_on) {
+            if (sequence_active || action_playing || resting) {
+                app_reset_sequence_state(&sequence_active,
+                                         &action_playing,
+                                         &resting,
+                                         completed_track,
+                                         &current_action_io,
+                                         &current_action_round,
+                                         &rest_until_tick,
+                                         &first_pressed_button);
+            }
+
+            if (xQueueReceive(evt_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
+                continue;
+            }
+            continue;
+        }
+
         if (xQueueReceive(evt_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (evt.type == AUDIO_PLAY_EVENT_BUTTON_PRESSED) {
                 uint8_t logical_io = evt.logical_io;
@@ -577,17 +613,146 @@ static void audio_play_event_task(void *arg)
 
 
 
-static void app_wifi_init()
+static esp_err_t app_wifi_init(void)
 {
-    esp_event_loop_create_default();
+    if (!s_event_loop_inited) {
+        esp_err_t loop_ret = esp_event_loop_create_default();
+        if ((loop_ret != ESP_OK) && (loop_ret != ESP_ERR_INVALID_STATE)) {
+            return loop_ret;
+        }
+        s_event_loop_inited = true;
+    }
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    if (!s_wifi_driver_inited) {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_ERROR_CHECK(esp_wifi_start());
+        ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi set mode failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "wifi set storage failed");
+        s_wifi_driver_inited = true;
+    }
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "wifi set ps failed");
+
+    esp_err_t start_ret = esp_wifi_start();
+    if ((start_ret != ESP_OK) && (start_ret != ESP_ERR_WIFI_CONN)) {
+        ESP_RETURN_ON_ERROR(start_ret, TAG, "wifi start failed");
+    }
+
+    return ESP_OK;
+}
+
+static void app_power_key_task(void *arg)
+{
+    (void)arg;
+
+    int previous_level = gpio_get_level(APP_POWER_KEY_GPIO);
+    TickType_t pressed_tick = 0;
+    bool pressed = false;
+
+    while (true) {
+        int current_level = gpio_get_level(APP_POWER_KEY_GPIO);
+
+        if (!pressed && previous_level == 1 && current_level == 0) {
+            pressed = true;
+            pressed_tick = xTaskGetTickCount();
+        } else if (pressed && previous_level == 0 && current_level == 1) {
+            TickType_t now = xTaskGetTickCount();
+            uint32_t pressed_ms = (uint32_t)((now - pressed_tick) * portTICK_PERIOD_MS);
+
+            if ((pressed_ms >= APP_POWER_KEY_MIN_MS) && (pressed_ms <= APP_POWER_KEY_MAX_MS)) {
+                uint8_t evt = 1;
+                if (s_power_key_evt_queue != NULL) {
+                    (void)xQueueSend(s_power_key_evt_queue, &evt, 0);
+                }
+            }
+            pressed = false;
+        }
+
+        previous_level = current_level;
+        vTaskDelay(pdMS_TO_TICKS(APP_POWER_KEY_SCAN_MS));
+    }
+}
+
+static esp_err_t app_start_normal_services(void)
+{
+    if (s_normal_services_started) {
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(app_wifi_init(), TAG, "wifi init/start failed");
+
+    espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(espnow_init(&espnow_config), TAG, "espnow init failed");
+
+    if (master_evt_queue == NULL) {
+        master_evt_queue = xQueueCreate(8, sizeof(master_evt_msg_t));
+        ESP_RETURN_ON_FALSE(master_evt_queue != NULL, ESP_ERR_NO_MEM, TAG, "master_evt_queue create failed");
+    }
+
+    ESP_RETURN_ON_ERROR(audio_play_set_io_mask(0xFF), TAG, "set audio io mask failed");
+    ESP_RETURN_ON_ERROR(espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle), TAG, "set espnow data callback failed");
+
+    BaseType_t task_ok = xTaskCreate(ms_pairing_task,
+                                     "ms_pairing",
+                                     4096,
+                                     NULL,
+                                     4,
+                                     NULL);
+    ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create ms_pairing_task failed");
+
+    task_ok = xTaskCreate(master_keepalive_monitor_task,
+                          "ms_keepalive",
+                          3072,
+                          NULL,
+                          3,
+                          &s_keepalive_task_handle);
+    ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create keepalive task failed");
+
+    if (s_audio_evt_task_handle == NULL) {
+        task_ok = xTaskCreate(audio_play_event_task,
+                              "audio_evt",
+                              4096,
+                              NULL,
+                              3,
+                              &s_audio_evt_task_handle);
+        ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create audio event task failed");
+    }
+
+    s_normal_services_started = true;
+    ESP_LOGI(TAG, "device power on: normal services started");
+    return ESP_OK;
+}
+
+static void app_stop_normal_services(void)
+{
+    if (!s_normal_services_started) {
+        return;
+    }
+
+    app_stop_current_action_flow();
+    esp_err_t stop_music_ret = audio_play_stop_playback();
+    if ((stop_music_ret != ESP_OK) && (stop_music_ret != ESP_ERR_INVALID_STATE)) {
+        ESP_LOGW(TAG, "stop music on power off failed: %s", esp_err_to_name(stop_music_ret));
+    }
+    (void)audio_play_set_io_mask(0xFF);
+
+    if (s_keepalive_task_handle != NULL) {
+        vTaskDelete(s_keepalive_task_handle);
+        s_keepalive_task_handle = NULL;
+    }
+
+    if (master_evt_queue != NULL) {
+        vQueueDelete(master_evt_queue);
+        master_evt_queue = NULL;
+    }
+
+    (void)espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, false, NULL);
+    (void)espnow_deinit();
+    (void)esp_wifi_stop();
+
+    s_normal_services_started = false;
+    ESP_LOGI(TAG, "device power off: normal services stopped");
 }
 
 
@@ -616,43 +781,44 @@ void app_main()
 
     ESP_ERROR_CHECK(audio_play_init());
 
-    app_wifi_init();
+    gpio_config_t power_key_cfg = {
+        .pin_bit_mask = 1ULL << APP_POWER_KEY_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&power_key_cfg));
 
-    espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
-    espnow_init(&espnow_config);
-    
-    master_evt_queue = xQueueCreate(8, sizeof(master_evt_msg_t));
+    s_power_key_evt_queue = xQueueCreate(4, sizeof(uint8_t));
+    ESP_ERROR_CHECK(s_power_key_evt_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
-    ESP_ERROR_CHECK(audio_play_set_io_mask(0xFF));
+    BaseType_t key_task_ok = xTaskCreate(app_power_key_task,
+                                         "power_key",
+                                         2048,
+                                         NULL,
+                                         5,
+                                         NULL);
+    ESP_ERROR_CHECK(key_task_ok == pdPASS ? ESP_OK : ESP_FAIL);
 
-    espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle);
-    //初始化完成，开始配对
+    // 上电默认关机，只监听 GPIO13 电源键。
+    s_device_power_on = false;
+    ESP_LOGI(TAG, "device boot in OFF state, wait GPIO13 short press to power on");
 
-    xTaskCreate(ms_pairing_task,
-            "ms_pairing",
-            4096,
-            NULL,
-            4,
-            NULL);
-
-        xTaskCreate(master_keepalive_monitor_task,
-            "ms_keepalive",
-            3072,
-            NULL,
-            3,
-            NULL);
-
-
-
-    xTaskCreate(audio_play_event_task,
-        "audio_evt",
-        4096,
-        NULL,
-        3,
-        NULL);
-
-
-
-
-    
+    while (true) {
+        uint8_t evt = 0;
+        if (xQueueReceive(s_power_key_evt_queue, &evt, portMAX_DELAY) == pdTRUE) {
+            if (!s_device_power_on) {
+                esp_err_t start_ret = app_start_normal_services();
+                if (start_ret == ESP_OK) {
+                    s_device_power_on = true;
+                } else {
+                    ESP_LOGE(TAG, "power on failed: %s", esp_err_to_name(start_ret));
+                }
+            } else {
+                s_device_power_on = false;
+                app_stop_normal_services();
+            }
+        }
+    }
 }

@@ -166,6 +166,14 @@ esp_err_t audio_play_trigger_mask_once(uint8_t bit_mask, uint32_t low_time_ms)
 	return ESP_OK;
 }
 
+esp_err_t audio_play_stop_playback(void)
+{
+	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
+	ESP_RETURN_ON_ERROR(dysv_uart_adapter_stop_playback(), TAG, "stop playback failed");
+	s_shadow_io_mask = 0xFF;
+	return ESP_OK;
+}
+
 esp_err_t audio_play_get_physical_gpio(uint8_t logical_io, gpio_num_t *gpio_num)
 {
 	(void)logical_io;

@@ -149,6 +149,15 @@ extern "C" esp_err_t dysv_uart_adapter_play_track(uint8_t song_number)
     return ESP_OK;
 }
 
+extern "C" esp_err_t dysv_uart_adapter_stop_playback(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
+    ESP_RETURN_ON_ERROR(lock_take(), TAG, "lock failed");
+    s_player.stopPlayback();
+    lock_give();
+    return ESP_OK;
+}
+
 extern "C" int dysv_uart_adapter_get_playback_state(void)
 {
     if (!s_initialized) {

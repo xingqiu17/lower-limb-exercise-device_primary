@@ -10,6 +10,7 @@ extern "C" {
 
 esp_err_t dysv_uart_adapter_init(void);
 esp_err_t dysv_uart_adapter_play_track(uint8_t song_number);
+esp_err_t dysv_uart_adapter_stop_playback(void);
 int dysv_uart_adapter_get_playback_state(void);
 
 #ifdef __cplusplus
