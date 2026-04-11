@@ -117,7 +117,7 @@ static void lock_give(void)
 
 } // namespace
 
-extern "C" esp_err_t dysv_uart_adapter_init(void)
+extern "C" esp_err_t dysv5w_init(void)
 {
     if (s_initialized) {
         return ESP_OK;
@@ -139,7 +139,7 @@ extern "C" esp_err_t dysv_uart_adapter_init(void)
     return ESP_OK;
 }
 
-extern "C" esp_err_t dysv_uart_adapter_play_track(uint8_t song_number)
+extern "C" esp_err_t dysv5w_play_track(uint8_t song_number)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
     ESP_RETURN_ON_FALSE(song_number > 0, ESP_ERR_INVALID_ARG, TAG, "invalid song number");
@@ -149,7 +149,7 @@ extern "C" esp_err_t dysv_uart_adapter_play_track(uint8_t song_number)
     return ESP_OK;
 }
 
-extern "C" esp_err_t dysv_uart_adapter_stop_playback(void)
+extern "C" esp_err_t dysv5w_stop_playback(void)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
     ESP_RETURN_ON_ERROR(lock_take(), TAG, "lock failed");
@@ -158,7 +158,7 @@ extern "C" esp_err_t dysv_uart_adapter_stop_playback(void)
     return ESP_OK;
 }
 
-extern "C" int dysv_uart_adapter_get_playback_state(void)
+extern "C" int dysv5w_get_playback_state(void)
 {
     if (!s_initialized) {
         return -1;
@@ -175,4 +175,36 @@ extern "C" int dysv_uart_adapter_get_playback_state(void)
         return -1;
     }
     return state;
+}
+
+
+extern "C" int dysv5w_set_volume(uint8_t volume)
+{
+    int volume_ptr = -1;
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
+    ESP_RETURN_ON_ERROR(lock_take(), TAG, "lock failed");
+    volume_ptr = s_player.setVolume(volume);
+    lock_give();
+    return volume_ptr;
+}
+
+
+extern "C" int dysv5w_volumeIncrement()
+{
+    int volume_ptr = -1;
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
+    ESP_RETURN_ON_ERROR(lock_take(), TAG, "lock failed");
+    volume_ptr = s_player.volumeIncrement();
+    lock_give();
+    return volume_ptr;
+}
+
+extern "C" int dysv5w_volumeDecrement()
+{
+    int volume_ptr = -1;
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
+    ESP_RETURN_ON_ERROR(lock_take(), TAG, "lock failed");
+    volume_ptr = s_player.volumeDecrement();
+    lock_give();
+    return volume_ptr;
 }

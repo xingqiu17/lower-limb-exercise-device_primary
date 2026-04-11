@@ -53,6 +53,8 @@ static const char *TAG = "app_main";
 #define APP_POWER_KEY_MAX_MS       1000
 #define APP_SLAVE_POWER_ACK_TIMEOUT_MS 1000
 
+
+
 typedef struct {
     uint16_t music_id;
     uint8_t trigger_mask;

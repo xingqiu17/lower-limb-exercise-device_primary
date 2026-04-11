@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 
 #include "dysv_uart_adapter.h"
+#include "driver/pulse_cnt.h"
 #include "esp_check.h"
 #include "esp_log.h"
 
@@ -15,6 +16,18 @@
 #define AUDIO_PLAY_BUTTON_MONITOR_TASK_STACK  2048
 #define AUDIO_PLAY_BUTTON_MONITOR_TASK_PRIO   4
 #define AUDIO_PLAY_BUTTON_MONITOR_PERIOD_MS   10
+#define AUDIO_PLAY_PCNT_HIGH_LIMIT            32767
+#define AUDIO_PLAY_PCNT_LOW_LIMIT             -32768
+#define AUDIO_PLAY_EC11_A                GPIO_NUM_10
+#define AUDIO_PLAY_EC11_B                GPIO_NUM_9
+#define AUDIO_PLAY_PCNT_TASK_STACK            4096
+#define AUDIO_PLAY_PCNT_TASK_PRIO             4
+#define AUDIO_PLAY_PCNT_REPORT_PERIOD_MS      20
+#define AUDIO_PLAY_VOLUME_MIN                 0
+#define AUDIO_PLAY_VOLUME_MAX                 30
+#define AUDIO_PLAY_VOLUME_DEFAULT             15
+#define AUDIO_PLAY_ENCODER_COUNTS_PER_STEP    4
+#define AUDIO_PLAY_ENCODER_CW_POSITIVE        1
 
 static const char *TAG = "audio_play";
 
@@ -28,8 +41,14 @@ static const gpio_num_t s_button_gpio_map[AUDIO_PLAY_BUTTON_NUM] = {
 static QueueHandle_t s_event_queue = NULL;
 static TaskHandle_t s_busy_monitor_task_handle = NULL;
 static TaskHandle_t s_button_monitor_task_handle = NULL;
+static TaskHandle_t s_pcnt_monitor_task_handle = NULL;
+static pcnt_unit_handle_t s_pcnt_unit = NULL;
+static pcnt_channel_handle_t s_pcnt_chan_a = NULL;
+static pcnt_channel_handle_t s_pcnt_chan_b = NULL;
 static bool s_is_initialized = false;
 static uint8_t s_shadow_io_mask = 0xFF;
+static int s_current_volume = AUDIO_PLAY_VOLUME_DEFAULT;
+static int s_encoder_accum_counts = 0;
 
 static bool audio_play_is_valid_logical_io(uint8_t logical_io)
 {
@@ -49,6 +68,132 @@ static bool audio_play_bitmask_to_song_number(uint8_t bit_mask, uint8_t *song_nu
 
 	*song_number = (uint8_t)candidate;
 	return true;
+}
+
+static void audio_play_apply_volume_delta_counts(int delta_counts)
+{
+#if !AUDIO_PLAY_ENCODER_CW_POSITIVE
+	delta_counts = -delta_counts;
+#endif
+
+	if (delta_counts == 0) {
+		return;
+	}
+
+	s_encoder_accum_counts += delta_counts;
+	int volume_steps = s_encoder_accum_counts / AUDIO_PLAY_ENCODER_COUNTS_PER_STEP;
+	if (volume_steps == 0) {
+		return;
+	}
+
+	int target_volume = s_current_volume + volume_steps;
+	if (target_volume > AUDIO_PLAY_VOLUME_MAX) {
+		target_volume = AUDIO_PLAY_VOLUME_MAX;
+		s_encoder_accum_counts = 0;
+	} else if (target_volume < AUDIO_PLAY_VOLUME_MIN) {
+		target_volume = AUDIO_PLAY_VOLUME_MIN;
+		s_encoder_accum_counts = 0;
+	} else {
+		s_encoder_accum_counts -= volume_steps * AUDIO_PLAY_ENCODER_COUNTS_PER_STEP;
+	}
+
+	if (target_volume == s_current_volume) {
+		return;
+	}
+
+	s_current_volume = target_volume;
+	(void)dysv5w_set_volume((uint8_t)s_current_volume);
+	ESP_LOGI(TAG, "encoder volume -> %d", s_current_volume);
+}
+
+static void audio_play_pcnt_monitor_task(void *arg)
+{
+	(void)arg;
+	int pulse_count = 0;
+	int prev_pulse_count = 0;
+
+	if (s_pcnt_unit != NULL) {
+		(void)pcnt_unit_get_count(s_pcnt_unit, &prev_pulse_count);
+	}
+
+	while (true) {
+		if (s_pcnt_unit != NULL && pcnt_unit_get_count(s_pcnt_unit, &pulse_count) == ESP_OK) {
+			int delta_counts = pulse_count - prev_pulse_count;
+			if (delta_counts != 0) {
+				audio_play_apply_volume_delta_counts(delta_counts);
+			}
+			prev_pulse_count = pulse_count;
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAY_PCNT_REPORT_PERIOD_MS));
+	}
+}
+
+static esp_err_t audio_play_init_pcnt(void)
+{
+	if (s_pcnt_unit != NULL) {
+		return ESP_OK;
+	}
+
+	pcnt_unit_config_t unit_config = {
+		.high_limit = AUDIO_PLAY_PCNT_HIGH_LIMIT,
+		.low_limit = AUDIO_PLAY_PCNT_LOW_LIMIT,
+	};
+	ESP_RETURN_ON_ERROR(pcnt_new_unit(&unit_config, &s_pcnt_unit), TAG, "pcnt new unit failed");
+
+	pcnt_glitch_filter_config_t filter_config = {
+		.max_glitch_ns = 1000,
+	};
+	ESP_RETURN_ON_ERROR(pcnt_unit_set_glitch_filter(s_pcnt_unit, &filter_config), TAG, "pcnt set glitch filter failed");
+
+	pcnt_chan_config_t chan_a_config = {
+		.edge_gpio_num = AUDIO_PLAY_EC11_A,
+		.level_gpio_num = AUDIO_PLAY_EC11_B,
+	};
+	ESP_RETURN_ON_ERROR(pcnt_new_channel(s_pcnt_unit, &chan_a_config, &s_pcnt_chan_a), TAG, "pcnt new channel A failed");
+
+	pcnt_chan_config_t chan_b_config = {
+		.edge_gpio_num = AUDIO_PLAY_EC11_B,
+		.level_gpio_num = AUDIO_PLAY_EC11_A,
+	};
+	ESP_RETURN_ON_ERROR(pcnt_new_channel(s_pcnt_unit, &chan_b_config, &s_pcnt_chan_b), TAG, "pcnt new channel B failed");
+
+	ESP_RETURN_ON_ERROR(pcnt_channel_set_edge_action(s_pcnt_chan_a,
+							 PCNT_CHANNEL_EDGE_ACTION_DECREASE,
+							 PCNT_CHANNEL_EDGE_ACTION_INCREASE),
+			    TAG,
+			    "pcnt set edge action A failed");
+	ESP_RETURN_ON_ERROR(pcnt_channel_set_level_action(s_pcnt_chan_a,
+							  PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+							  PCNT_CHANNEL_LEVEL_ACTION_INVERSE),
+			    TAG,
+			    "pcnt set level action A failed");
+
+	ESP_RETURN_ON_ERROR(pcnt_channel_set_edge_action(s_pcnt_chan_b,
+							 PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+							 PCNT_CHANNEL_EDGE_ACTION_DECREASE),
+			    TAG,
+			    "pcnt set edge action B failed");
+	ESP_RETURN_ON_ERROR(pcnt_channel_set_level_action(s_pcnt_chan_b,
+							  PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+							  PCNT_CHANNEL_LEVEL_ACTION_INVERSE),
+			    TAG,
+			    "pcnt set level action B failed");
+
+	ESP_RETURN_ON_ERROR(pcnt_unit_enable(s_pcnt_unit), TAG, "pcnt enable failed");
+	ESP_RETURN_ON_ERROR(pcnt_unit_clear_count(s_pcnt_unit), TAG, "pcnt clear count failed");
+	ESP_RETURN_ON_ERROR(pcnt_unit_start(s_pcnt_unit), TAG, "pcnt start failed");
+
+	BaseType_t task_ok = xTaskCreate(audio_play_pcnt_monitor_task,
+					 "pcnt_monitor",
+					 AUDIO_PLAY_PCNT_TASK_STACK,
+					 NULL,
+					 AUDIO_PLAY_PCNT_TASK_PRIO,
+					 &s_pcnt_monitor_task_handle);
+	ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create pcnt monitor task failed");
+
+	ESP_LOGI(TAG, "pcnt init done, EC11 A=%d B=%d, volume range=%d-%d", AUDIO_PLAY_EC11_A, AUDIO_PLAY_EC11_B, AUDIO_PLAY_VOLUME_MIN, AUDIO_PLAY_VOLUME_MAX);
+	return ESP_OK;
 }
 
 static void audio_play_busy_monitor_task(void *arg)
@@ -158,7 +303,7 @@ esp_err_t audio_play_trigger_mask_once(uint8_t bit_mask, uint32_t low_time_ms)
 				   (unsigned)bit_mask);
 
 	s_shadow_io_mask = bit_mask;
-	ESP_RETURN_ON_ERROR(dysv_uart_adapter_play_track(song_number), TAG, "play song %u failed", (unsigned)song_number);
+	ESP_RETURN_ON_ERROR(dysv5w_play_track(song_number), TAG, "play song %u failed", (unsigned)song_number);
 	if (low_time_ms > 0) {
 		vTaskDelay(pdMS_TO_TICKS(low_time_ms));
 	}
@@ -169,7 +314,7 @@ esp_err_t audio_play_trigger_mask_once(uint8_t bit_mask, uint32_t low_time_ms)
 esp_err_t audio_play_stop_playback(void)
 {
 	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
-	ESP_RETURN_ON_ERROR(dysv_uart_adapter_stop_playback(), TAG, "stop playback failed");
+	ESP_RETURN_ON_ERROR(dysv5w_stop_playback(), TAG, "stop playback failed");
 	s_shadow_io_mask = 0xFF;
 	return ESP_OK;
 }
@@ -192,7 +337,8 @@ esp_err_t audio_play_init(void)
 		return ESP_OK;
 	}
 
-	ESP_RETURN_ON_ERROR(dysv_uart_adapter_init(), TAG, "init DYSV UART adapter failed");
+	ESP_RETURN_ON_ERROR(dysv5w_init(), TAG, "init DYSV UART adapter failed");
+	ESP_RETURN_ON_ERROR(audio_play_init_pcnt(), TAG, "init PCNT failed");
 
 	gpio_config_t busy_input_cfg = {
 		.pin_bit_mask = 1ULL << AUDIO_PLAY_BUSY_MONITOR_GPIO,
@@ -240,6 +386,10 @@ esp_err_t audio_play_init(void)
 
 	s_is_initialized = true;
 	ESP_LOGI(TAG, "audio_play init done, DYSV UART mode enabled, monitor BUSY(GPIO8), BUTTON1-4(GPIO7/6/5/4)");
+
+	s_current_volume = AUDIO_PLAY_VOLUME_DEFAULT;
+	s_encoder_accum_counts = 0;
+	(void)dysv5w_set_volume((uint8_t)s_current_volume); // TODO: use NVS stored volume
 
 	return ESP_OK;
 }
