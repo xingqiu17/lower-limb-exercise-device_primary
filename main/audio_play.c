@@ -7,6 +7,7 @@
 #include "driver/pulse_cnt.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "nvs.h"
 
 #define AUDIO_PLAY_BUSY_MONITOR_GPIO          GPIO_NUM_8
 #define AUDIO_PLAY_EVENT_QUEUE_LEN            8
@@ -28,6 +29,9 @@
 #define AUDIO_PLAY_VOLUME_DEFAULT             15
 #define AUDIO_PLAY_ENCODER_COUNTS_PER_STEP    4
 #define AUDIO_PLAY_ENCODER_CW_POSITIVE        1
+#define AUDIO_PLAY_VOLUME_SAVE_IDLE_MS        3000
+#define AUDIO_PLAY_NVS_NAMESPACE              "audio_play"
+#define AUDIO_PLAY_NVS_KEY_VOLUME             "volume"
 
 static const char *TAG = "audio_play";
 
@@ -49,6 +53,63 @@ static bool s_is_initialized = false;
 static uint8_t s_shadow_io_mask = 0xFF;
 static int s_current_volume = AUDIO_PLAY_VOLUME_DEFAULT;
 static int s_encoder_accum_counts = 0;
+static bool s_volume_nvs_dirty = false;
+static TickType_t s_volume_last_change_tick = 0;
+
+static int audio_play_clamp_volume(int volume)
+{
+	if (volume < AUDIO_PLAY_VOLUME_MIN) {
+		return AUDIO_PLAY_VOLUME_MIN;
+	}
+	if (volume > AUDIO_PLAY_VOLUME_MAX) {
+		return AUDIO_PLAY_VOLUME_MAX;
+	}
+	return volume;
+}
+
+static esp_err_t audio_play_load_volume_from_nvs(int *volume)
+{
+	ESP_RETURN_ON_FALSE(volume != NULL, ESP_ERR_INVALID_ARG, TAG, "volume ptr is null");
+
+	nvs_handle_t nvs = 0;
+	esp_err_t err = nvs_open(AUDIO_PLAY_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	uint8_t stored_volume = AUDIO_PLAY_VOLUME_DEFAULT;
+	err = nvs_get_u8(nvs, AUDIO_PLAY_NVS_KEY_VOLUME, &stored_volume);
+	nvs_close(nvs);
+
+	if (err == ESP_OK) {
+		*volume = audio_play_clamp_volume((int)stored_volume);
+		return ESP_OK;
+	}
+
+	if (err == ESP_ERR_NVS_NOT_FOUND) {
+		*volume = AUDIO_PLAY_VOLUME_DEFAULT;
+		return ESP_OK;
+	}
+
+	return err;
+}
+
+static esp_err_t audio_play_save_volume_to_nvs(int volume)
+{
+	uint8_t stored_volume = (uint8_t)audio_play_clamp_volume(volume);
+	nvs_handle_t nvs = 0;
+	esp_err_t err = nvs_open(AUDIO_PLAY_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	err = nvs_set_u8(nvs, AUDIO_PLAY_NVS_KEY_VOLUME, stored_volume);
+	if (err == ESP_OK) {
+		err = nvs_commit(nvs);
+	}
+	nvs_close(nvs);
+	return err;
+}
 
 static bool audio_play_is_valid_logical_io(uint8_t logical_io)
 {
@@ -103,6 +164,8 @@ static void audio_play_apply_volume_delta_counts(int delta_counts)
 
 	s_current_volume = target_volume;
 	(void)dysv5w_set_volume((uint8_t)s_current_volume);
+	s_volume_nvs_dirty = true;
+	s_volume_last_change_tick = xTaskGetTickCount();
 	ESP_LOGI(TAG, "encoder volume -> %d", s_current_volume);
 }
 
@@ -123,6 +186,20 @@ static void audio_play_pcnt_monitor_task(void *arg)
 				audio_play_apply_volume_delta_counts(delta_counts);
 			}
 			prev_pulse_count = pulse_count;
+		}
+
+		if (s_volume_nvs_dirty) {
+			TickType_t now = xTaskGetTickCount();
+			if ((now - s_volume_last_change_tick) >= pdMS_TO_TICKS(AUDIO_PLAY_VOLUME_SAVE_IDLE_MS)) {
+				esp_err_t save_err = audio_play_save_volume_to_nvs(s_current_volume);
+				if (save_err == ESP_OK) {
+					s_volume_nvs_dirty = false;
+					ESP_LOGI(TAG, "volume saved to NVS -> %d", s_current_volume);
+				} else {
+					s_volume_last_change_tick = now;
+					ESP_LOGW(TAG, "save volume to NVS failed: %s", esp_err_to_name(save_err));
+				}
+			}
 		}
 
 		vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAY_PCNT_REPORT_PERIOD_MS));
@@ -387,9 +464,19 @@ esp_err_t audio_play_init(void)
 	s_is_initialized = true;
 	ESP_LOGI(TAG, "audio_play init done, DYSV UART mode enabled, monitor BUSY(GPIO8), BUTTON1-4(GPIO7/6/5/4)");
 
-	s_current_volume = AUDIO_PLAY_VOLUME_DEFAULT;
+	int initial_volume = AUDIO_PLAY_VOLUME_DEFAULT;
+	esp_err_t load_err = audio_play_load_volume_from_nvs(&initial_volume);
+	if (load_err != ESP_OK) {
+		ESP_LOGW(TAG, "load volume from NVS failed, use default=%d, err=%s", AUDIO_PLAY_VOLUME_DEFAULT, esp_err_to_name(load_err));
+		initial_volume = AUDIO_PLAY_VOLUME_DEFAULT;
+	}
+
+	s_current_volume = audio_play_clamp_volume(initial_volume);
 	s_encoder_accum_counts = 0;
-	(void)dysv5w_set_volume((uint8_t)s_current_volume); // TODO: use NVS stored volume
+	s_volume_nvs_dirty = false;
+	s_volume_last_change_tick = xTaskGetTickCount();
+	(void)dysv5w_set_volume((uint8_t)s_current_volume);
+	ESP_LOGI(TAG, "initial volume=%d", s_current_volume);
 
 	return ESP_OK;
 }
