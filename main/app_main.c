@@ -711,6 +711,7 @@ static esp_err_t app_start_normal_services(void)
         ESP_RETURN_ON_FALSE(master_evt_queue != NULL, ESP_ERR_NO_MEM, TAG, "master_evt_queue create failed");
     }
 
+    ESP_RETURN_ON_ERROR(audio_play_set_encoder_enabled(true), TAG, "enable encoder volume failed");
     ESP_RETURN_ON_ERROR(audio_play_set_io_mask(0xFF), TAG, "set audio io mask failed");
     ESP_RETURN_ON_ERROR(espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle), TAG, "set espnow data callback failed");
 
@@ -763,6 +764,7 @@ static void app_stop_normal_services(void)
     if ((stop_music_ret != ESP_OK) && (stop_music_ret != ESP_ERR_INVALID_STATE)) {
         ESP_LOGW(TAG, "stop music on power off failed: %s", esp_err_to_name(stop_music_ret));
     }
+    (void)audio_play_set_encoder_enabled(false);
     (void)audio_play_set_io_mask(0xFF);
 
     if (s_keepalive_task_handle != NULL) {
@@ -813,6 +815,7 @@ void app_main()
     ESP_ERROR_CHECK(s_gpio2_toggle_timer != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK(audio_play_init());
+    ESP_ERROR_CHECK(audio_play_set_encoder_enabled(false));
 
     gpio_config_t power_key_cfg = {
         .pin_bit_mask = 1ULL << APP_POWER_KEY_GPIO,

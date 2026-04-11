@@ -55,6 +55,7 @@ static int s_current_volume = AUDIO_PLAY_VOLUME_DEFAULT;
 static int s_encoder_accum_counts = 0;
 static bool s_volume_nvs_dirty = false;
 static TickType_t s_volume_last_change_tick = 0;
+static bool s_encoder_volume_enabled = false;
 
 static int audio_play_clamp_volume(int volume)
 {
@@ -181,9 +182,13 @@ static void audio_play_pcnt_monitor_task(void *arg)
 
 	while (true) {
 		if (s_pcnt_unit != NULL && pcnt_unit_get_count(s_pcnt_unit, &pulse_count) == ESP_OK) {
-			int delta_counts = pulse_count - prev_pulse_count;
-			if (delta_counts != 0) {
-				audio_play_apply_volume_delta_counts(delta_counts);
+			if (s_encoder_volume_enabled) {
+				int delta_counts = pulse_count - prev_pulse_count;
+				if (delta_counts != 0) {
+					audio_play_apply_volume_delta_counts(delta_counts);
+				}
+			} else {
+				s_encoder_accum_counts = 0;
 			}
 			prev_pulse_count = pulse_count;
 		}
@@ -396,6 +401,17 @@ esp_err_t audio_play_stop_playback(void)
 	return ESP_OK;
 }
 
+esp_err_t audio_play_set_encoder_enabled(bool enabled)
+{
+	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
+	s_encoder_volume_enabled = enabled;
+	if (!enabled) {
+		s_encoder_accum_counts = 0;
+	}
+	ESP_LOGI(TAG, "encoder volume control %s", enabled ? "enabled" : "disabled");
+	return ESP_OK;
+}
+
 esp_err_t audio_play_get_physical_gpio(uint8_t logical_io, gpio_num_t *gpio_num)
 {
 	(void)logical_io;
@@ -473,6 +489,7 @@ esp_err_t audio_play_init(void)
 
 	s_current_volume = audio_play_clamp_volume(initial_volume);
 	s_encoder_accum_counts = 0;
+	s_encoder_volume_enabled = false;
 	s_volume_nvs_dirty = false;
 	s_volume_last_change_tick = xTaskGetTickCount();
 	(void)dysv5w_set_volume((uint8_t)s_current_volume);
