@@ -95,6 +95,7 @@ static bool s_normal_services_started = false;
 static bool s_wifi_driver_inited = false;
 static bool s_event_loop_inited = false;
 static QueueHandle_t s_power_key_evt_queue = NULL;
+static TaskHandle_t s_pairing_task_handle = NULL;
 static TaskHandle_t s_keepalive_task_handle = NULL;
 static TaskHandle_t s_audio_evt_task_handle = NULL;
 
@@ -718,7 +719,7 @@ static esp_err_t app_start_normal_services(void)
                                      4096,
                                      NULL,
                                      4,
-                                     NULL);
+                                     &s_pairing_task_handle);
     ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create ms_pairing_task failed");
 
     task_ok = xTaskCreate(master_keepalive_monitor_task,
@@ -769,14 +770,19 @@ static void app_stop_normal_services(void)
         s_keepalive_task_handle = NULL;
     }
 
-    if (master_evt_queue != NULL) {
-        vQueueDelete(master_evt_queue);
-        master_evt_queue = NULL;
+    if (s_pairing_task_handle != NULL) {
+        vTaskDelete(s_pairing_task_handle);
+        s_pairing_task_handle = NULL;
     }
 
     (void)espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, false, NULL);
     (void)espnow_deinit();
     (void)esp_wifi_stop();
+
+    if (master_evt_queue != NULL) {
+        vQueueDelete(master_evt_queue);
+        master_evt_queue = NULL;
+    }
 
     s_normal_services_started = false;
     ESP_LOGI(TAG, "device power off: normal services stopped");
