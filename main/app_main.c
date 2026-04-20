@@ -43,10 +43,8 @@ static const char *TAG = "app_main";
 #define APP_GPIO2_START_DELAY_MS   5000
 #define APP_REST_TIME_MS           30000
 #define APP_PLAYS_PER_ACTION       2
-#define APP_ACTION3_RED_ON_MS      120
-#define APP_ACTION3_RED_OFF_MS     480
-#define APP_ACTION4_RED_ON_MS      150
-#define APP_ACTION4_RED_OFF_MS     600
+#define APP_ACTION34_INDICATOR_ON_MS 500
+#define APP_ACTION34_INDICATOR_OFF_MS 500
 #define APP_POWER_KEY_GPIO         GPIO_NUM_13
 #define APP_POWER_KEY_SCAN_MS      20
 #define APP_POWER_KEY_MIN_MS       30
@@ -90,6 +88,7 @@ static bool s_action_running = false;
 static bool s_gpio2_is_red = true;
 static uint32_t s_gpio2_action_mode = 0;
 static bool s_gpio2_blink_enabled = false;
+static bool s_gpio2_indicator_started = false;
 static volatile bool s_device_power_on = false;
 static bool s_normal_services_started = false;
 static bool s_wifi_driver_inited = false;
@@ -190,16 +189,65 @@ static bool app_gpio2_get_phase_ms(uint32_t action_mode, bool red_phase, uint32_
     }
 
     if (action_mode == 3) {
-        *phase_ms = red_phase ? APP_ACTION3_RED_ON_MS : APP_ACTION3_RED_OFF_MS;
+        *phase_ms = red_phase ? APP_ACTION34_INDICATOR_ON_MS : APP_ACTION34_INDICATOR_OFF_MS;
         return true;
     }
 
     if (action_mode == 4) {
-        *phase_ms = red_phase ? APP_ACTION4_RED_ON_MS : APP_ACTION4_RED_OFF_MS;
+        *phase_ms = red_phase ? APP_ACTION34_INDICATOR_ON_MS : APP_ACTION34_INDICATOR_OFF_MS;
         return true;
     }
 
     return false;
+}
+
+static void app_gpio2_refresh_display(void)
+{
+    uint8_t indicator1_on = 0;
+    uint8_t indicator1_r = 0;
+    uint8_t indicator1_g = 0;
+    uint8_t indicator1_b = 0;
+    uint8_t indicator2_on = 0;
+    uint8_t indicator2_r = 0;
+    uint8_t indicator2_g = 0;
+    uint8_t indicator2_b = 0;
+    uint8_t active_action = 0;
+    uint8_t status_on = 0;
+
+    if (s_action_running && (s_gpio2_action_mode >= 1U) && (s_gpio2_action_mode <= APP_ACTION_COUNT)) {
+        active_action = (uint8_t)s_gpio2_action_mode;
+        status_on = 1;
+
+        if (s_gpio2_blink_enabled && s_gpio2_indicator_started) {
+            if ((s_gpio2_action_mode == 1U) || (s_gpio2_action_mode == 2U)) {
+                if (s_gpio2_is_red) {
+                    indicator1_on = 1;
+                    indicator1_r = 255;
+                } else {
+                    indicator2_on = 1;
+                    indicator2_g = 255;
+                }
+            } else if ((s_gpio2_action_mode == 3U) || (s_gpio2_action_mode == 4U)) {
+                if (s_gpio2_is_red) {
+                    indicator1_on = 1;
+                    indicator1_r = 255;
+                    indicator2_on = 1;
+                    indicator2_r = 255;
+                }
+            }
+        }
+    }
+
+    (void)neopixel_ctrl_set_gpio2_action_panel(indicator1_on,
+                                               indicator1_r,
+                                               indicator1_g,
+                                               indicator1_b,
+                                               indicator2_on,
+                                               indicator2_r,
+                                               indicator2_g,
+                                               indicator2_b,
+                                               active_action,
+                                               status_on);
 }
 
 static void app_gpio2_schedule_next_toggle(void)
@@ -226,8 +274,9 @@ static void app_gpio2_start_delay_timer_cb(TimerHandle_t timer)
         return;
     }
 
+    s_gpio2_indicator_started = true;
     s_gpio2_is_red = true;
-    (void)neopixel_ctrl_set_gpio2_all_rgb(255, 0, 0);
+    app_gpio2_refresh_display();
     app_gpio2_schedule_next_toggle();
 }
 
@@ -240,15 +289,7 @@ static void app_gpio2_toggle_timer_cb(TimerHandle_t timer)
     }
 
     s_gpio2_is_red = !s_gpio2_is_red;
-    if (s_gpio2_is_red) {
-        (void)neopixel_ctrl_set_gpio2_all_rgb(255, 0, 0);
-    } else {
-        if (s_gpio2_action_mode == 3 || s_gpio2_action_mode == 4) {
-            (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
-        } else {
-            (void)neopixel_ctrl_set_gpio2_all_rgb(0, 255, 0);
-        }
-    }
+    app_gpio2_refresh_display();
 
     app_gpio2_schedule_next_toggle();
 }
@@ -262,6 +303,7 @@ static void app_set_action_running(bool running, uint32_t action_mode)
         s_gpio2_action_mode = action_mode;
         s_gpio2_is_red = true;
         s_gpio2_blink_enabled = app_gpio2_get_phase_ms(action_mode, true, &phase_ms);
+        s_gpio2_indicator_started = false;
 
         if (s_gpio2_start_delay_timer != NULL) {
             (void)xTimerStop(s_gpio2_start_delay_timer, 0);
@@ -270,7 +312,7 @@ static void app_set_action_running(bool running, uint32_t action_mode)
             (void)xTimerStop(s_gpio2_toggle_timer, 0);
         }
 
-        (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
+        app_gpio2_refresh_display();
 
         if (s_gpio2_blink_enabled && s_gpio2_start_delay_timer != NULL) {
             (void)xTimerStart(s_gpio2_start_delay_timer, 0);
@@ -282,13 +324,14 @@ static void app_set_action_running(bool running, uint32_t action_mode)
     s_action_running = false;
     s_gpio2_action_mode = 0;
     s_gpio2_blink_enabled = false;
+    s_gpio2_indicator_started = false;
     if (s_gpio2_start_delay_timer != NULL) {
         (void)xTimerStop(s_gpio2_start_delay_timer, 0);
     }
     if (s_gpio2_toggle_timer != NULL) {
         (void)xTimerStop(s_gpio2_toggle_timer, 0);
     }
-    (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
+    app_gpio2_refresh_display();
 }
 
 static esp_err_t app_sync_action_and_play(uint8_t track_index)
@@ -690,7 +733,7 @@ static void app_stop_user_visible_output_now(void)
 
     (void)audio_play_set_io_mask(0xFF);
     (void)neopixel_ctrl_set_gpio1_progress_red(0);
-    (void)neopixel_ctrl_set_gpio2_all_rgb(0, 0, 0);
+    (void)neopixel_ctrl_set_gpio2_action_panel(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 static esp_err_t app_start_normal_services(void)
