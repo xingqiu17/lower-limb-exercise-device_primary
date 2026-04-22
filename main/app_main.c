@@ -30,9 +30,11 @@
 
 #include "audio_play.h"
 #include "neopixel_ctrl.h"
+#include "gpio_wakeup.h"
 
 #include "espnow_sr.h"
 #include "state_machine.h"
+#include "esp_sleep.h"
 
 static const char *TAG = "app_main";
 
@@ -101,6 +103,10 @@ static TaskHandle_t s_audio_evt_task_handle = NULL;
 static esp_err_t app_start_normal_services(void);
 static void app_stop_normal_services(void);
 static void app_stop_user_visible_output_now(void);
+static void app_clear_audio_event_queue(void);
+static void app_prepare_clean_training_state(void);
+static bool app_is_training_flow_allowed(void);
+static bool app_delay_abort_on_shutdown(uint32_t delay_ms);
 
 static const app_music_trigger_t *app_get_music_trigger(uint8_t track_index)
 {
@@ -438,6 +444,30 @@ static void app_reset_sequence_state(bool *sequence_active,
     *first_pressed_button = -1;
 }
 
+static bool app_is_training_flow_allowed(void)
+{
+    return s_device_power_on && !master_is_shutdown_in_progress();
+}
+
+static bool app_delay_abort_on_shutdown(uint32_t delay_ms)
+{
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(delay_ms);
+    while (true) {
+        if (!app_is_training_flow_allowed()) {
+            return false;
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(deadline - now) <= 0) {
+            return true;
+        }
+
+        TickType_t remain = deadline - now;
+        TickType_t step = remain > pdMS_TO_TICKS(20) ? pdMS_TO_TICKS(20) : remain;
+        vTaskDelay(step);
+    }
+}
+
 
 
 static void audio_play_event_task(void *arg)
@@ -480,6 +510,18 @@ static void audio_play_event_task(void *arg)
         }
 
         if (xQueueReceive(evt_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (!app_is_training_flow_allowed()) {
+                app_reset_sequence_state(&sequence_active,
+                                         &action_playing,
+                                         &resting,
+                                         completed_track,
+                                         &current_action_io,
+                                         &current_action_round,
+                                         &rest_until_tick,
+                                         &first_pressed_button);
+                continue;
+            }
+
             if (evt.type == AUDIO_PLAY_EVENT_BUTTON_PRESSED) {
                 uint8_t logical_io = evt.logical_io;
 
@@ -545,7 +587,30 @@ static void audio_play_event_task(void *arg)
                     uint16_t finished_action_music_id = app_get_music_id(current_action_io);
                     uint16_t prompt_music_id = app_get_round_rest_prompt_music_id(finished_action_music_id);
                     if (prompt_music_id != 0) {
-                        vTaskDelay(pdMS_TO_TICKS(APP_PROMPT_DELAY_AFTER_STOP_MS));
+                        if (!app_delay_abort_on_shutdown(APP_PROMPT_DELAY_AFTER_STOP_MS)) {
+                            app_reset_sequence_state(&sequence_active,
+                                                     &action_playing,
+                                                     &resting,
+                                                     completed_track,
+                                                     &current_action_io,
+                                                     &current_action_round,
+                                                     &rest_until_tick,
+                                                     &first_pressed_button);
+                            continue;
+                        }
+
+                        if (!app_is_training_flow_allowed()) {
+                            app_reset_sequence_state(&sequence_active,
+                                                     &action_playing,
+                                                     &resting,
+                                                     completed_track,
+                                                     &current_action_io,
+                                                     &current_action_round,
+                                                     &rest_until_tick,
+                                                     &first_pressed_button);
+                            continue;
+                        }
+
                         esp_err_t prompt_ret = app_play_music_by_id(prompt_music_id);
                         if (prompt_ret != ESP_OK) {
                             ESP_LOGW(TAG,
@@ -601,7 +666,30 @@ static void audio_play_event_task(void *arg)
                 uint16_t finished_action_music_id = app_get_music_id(current_action_io);
                 uint16_t prompt_music_id = app_get_action_finish_prompt_music_id(finished_action_music_id);
                 if (prompt_music_id != 0) {
-                    vTaskDelay(pdMS_TO_TICKS(APP_PROMPT_DELAY_AFTER_STOP_MS));
+                    if (!app_delay_abort_on_shutdown(APP_PROMPT_DELAY_AFTER_STOP_MS)) {
+                        app_reset_sequence_state(&sequence_active,
+                                                 &action_playing,
+                                                 &resting,
+                                                 completed_track,
+                                                 &current_action_io,
+                                                 &current_action_round,
+                                                 &rest_until_tick,
+                                                 &first_pressed_button);
+                        continue;
+                    }
+
+                    if (!app_is_training_flow_allowed()) {
+                        app_reset_sequence_state(&sequence_active,
+                                                 &action_playing,
+                                                 &resting,
+                                                 completed_track,
+                                                 &current_action_io,
+                                                 &current_action_round,
+                                                 &rest_until_tick,
+                                                 &first_pressed_button);
+                        continue;
+                    }
+
                     esp_err_t prompt_ret = app_play_music_by_id(prompt_music_id);
                     if (prompt_ret != ESP_OK) {
                         ESP_LOGW(TAG,
@@ -626,6 +714,18 @@ static void audio_play_event_task(void *arg)
         }
 
         if (sequence_active && resting) {
+            if (!app_is_training_flow_allowed()) {
+                app_reset_sequence_state(&sequence_active,
+                                         &action_playing,
+                                         &resting,
+                                         completed_track,
+                                         &current_action_io,
+                                         &current_action_round,
+                                         &rest_until_tick,
+                                         &first_pressed_button);
+                continue;
+            }
+
             TickType_t now = xTaskGetTickCount();
             if ((int32_t)(now - rest_until_tick) >= 0) {
                 esp_err_t play_ret = app_start_action_flow(current_action_io);
@@ -694,31 +794,18 @@ static void app_power_key_task(void *arg)
 {
     (void)arg;
 
-    int previous_level = gpio_get_level(APP_POWER_KEY_GPIO);
-    TickType_t pressed_tick = 0;
-    bool pressed = false;
-
     while (true) {
-        int current_level = gpio_get_level(APP_POWER_KEY_GPIO);
-
-        if (!pressed && previous_level == 1 && current_level == 0) {
-            pressed = true;
-            pressed_tick = xTaskGetTickCount();
-        } else if (pressed && previous_level == 0 && current_level == 1) {
-            TickType_t now = xTaskGetTickCount();
-            uint32_t pressed_ms = (uint32_t)((now - pressed_tick) * portTICK_PERIOD_MS);
-
-            if ((pressed_ms >= APP_POWER_KEY_MIN_MS) && (pressed_ms <= APP_POWER_KEY_MAX_MS)) {
-                uint8_t evt = 1;
-                if (s_power_key_evt_queue != NULL) {
-                    (void)xQueueSend(s_power_key_evt_queue, &evt, 0);
-                }
-            }
-            pressed = false;
+        if (!s_device_power_on) {
+            vTaskDelay(pdMS_TO_TICKS(APP_POWER_KEY_SCAN_MS));
+            continue;
         }
 
-        previous_level = current_level;
-        vTaskDelay(pdMS_TO_TICKS(APP_POWER_KEY_SCAN_MS));
+        if (lp_power_key_poll_short_press(APP_POWER_KEY_MIN_MS, APP_POWER_KEY_MAX_MS)) {
+            uint8_t evt = 1;
+            if (s_power_key_evt_queue != NULL) {
+                (void)xQueueSend(s_power_key_evt_queue, &evt, 0);
+            }
+        }
     }
 }
 
@@ -734,6 +821,31 @@ static void app_stop_user_visible_output_now(void)
     (void)audio_play_set_io_mask(0xFF);
     (void)neopixel_ctrl_set_gpio1_progress_red(0);
     (void)neopixel_ctrl_set_gpio2_action_panel(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+static void app_clear_audio_event_queue(void)
+{
+    QueueHandle_t evt_queue = audio_play_get_event_queue();
+    if (evt_queue == NULL) {
+        return;
+    }
+
+    audio_play_event_t evt;
+    uint32_t dropped = 0;
+    while (xQueueReceive(evt_queue, &evt, 0) == pdTRUE) {
+        dropped++;
+    }
+
+    if (dropped > 0) {
+        ESP_LOGI(TAG, "clear stale audio events: %lu", (unsigned long)dropped);
+    }
+}
+
+static void app_prepare_clean_training_state(void)
+{
+    master_set_current_action_mode(0);
+    app_set_action_running(false, 0);
+    app_clear_audio_event_queue();
 }
 
 static esp_err_t app_start_normal_services(void)
@@ -859,15 +971,7 @@ void app_main()
 
     ESP_ERROR_CHECK(audio_play_init());
     ESP_ERROR_CHECK(audio_play_set_encoder_enabled(false));
-
-    gpio_config_t power_key_cfg = {
-        .pin_bit_mask = 1ULL << APP_POWER_KEY_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&power_key_cfg));
+    ESP_ERROR_CHECK(lp_power_key_init(APP_POWER_KEY_GPIO));
 
     s_power_key_evt_queue = xQueueCreate(4, sizeof(uint8_t));
     ESP_ERROR_CHECK(s_power_key_evt_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
@@ -880,42 +984,61 @@ void app_main()
                                          NULL);
     ESP_ERROR_CHECK(key_task_ok == pdPASS ? ESP_OK : ESP_FAIL);
 
-    // 上电默认关机，只监听 GPIO13 电源键。
+    // 上电默认进入轻睡眠，GPIO13短按唤醒开机。
     s_device_power_on = false;
-    ESP_LOGI(TAG, "device boot in OFF state, wait GPIO13 short press to power on");
+    ESP_LOGI(TAG, "init done, enter light sleep automatically");
 
     while (true) {
+        if (!s_device_power_on) {
+            lp_sleep_result_t sleep_result = {0};
+            esp_err_t sleep_ret = lp_enter_light_sleep(&sleep_result);
+            if (sleep_ret != ESP_OK) {
+                ESP_LOGE(TAG, "enter light sleep failed: %s", esp_err_to_name(sleep_ret));
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
+            if (sleep_result.wakeup_cause != ESP_SLEEP_WAKEUP_GPIO) {
+                ESP_LOGW(TAG, "non-GPIO wakeup, re-enter light sleep");
+                continue;
+            }
+
+            esp_err_t start_ret = app_start_normal_services();
+            if (start_ret != ESP_OK) {
+                ESP_LOGE(TAG, "power on failed after wakeup: %s", esp_err_to_name(start_ret));
+                continue;
+            }
+
+            app_prepare_clean_training_state();
+            s_device_power_on = true;
+            ESP_LOGI(TAG, "device power on by GPIO13");
+            continue;
+        }
+
         uint8_t evt = 0;
         if (xQueueReceive(s_power_key_evt_queue, &evt, portMAX_DELAY) == pdTRUE) {
-            if (!s_device_power_on) {
-                esp_err_t start_ret = app_start_normal_services();
-                if (start_ret == ESP_OK) {
-                    s_device_power_on = true;
-                } else {
-                    ESP_LOGE(TAG, "power on failed: %s", esp_err_to_name(start_ret));
-                }
-            } else {
-                master_set_shutdown_in_progress(true);
+            master_set_shutdown_in_progress(true);
 
-                // 1) 用户可见输出立即停止（零体感延迟）
-                app_stop_user_visible_output_now();
-                s_device_power_on = false;
+            // 1) 用户可见输出立即停止（零体感延迟）
+            app_stop_user_visible_output_now();
+            s_device_power_on = false;
 
-                // 2) 主机向从机发关机指令（data=0），并等待从机确认（data=2）
-                esp_err_t pwr_off_send_ret = master_send_power_manage_to_ready_slaves(0);
-                bool got_ack = false;
-                if (pwr_off_send_ret == ESP_OK) {
-                    got_ack = master_wait_slave_power_ack(APP_SLAVE_POWER_ACK_TIMEOUT_MS);
-                } else if (pwr_off_send_ret != ESP_ERR_NOT_FOUND) {
-                    ESP_LOGW(TAG, "send slave power off cmd failed: %s", esp_err_to_name(pwr_off_send_ret));
-                }
-
-                if (!got_ack) {
-                    ESP_LOGW(TAG, "slave power off ack timeout, continue local shutdown");
-                }
-
-                app_stop_normal_services();
+            // 2) 主机向从机发关机指令（data=0），并等待从机确认（data=2）
+            esp_err_t pwr_off_send_ret = master_send_power_manage_to_ready_slaves(0);
+            bool got_ack = false;
+            if (pwr_off_send_ret == ESP_OK) {
+                got_ack = master_wait_slave_power_ack(APP_SLAVE_POWER_ACK_TIMEOUT_MS);
+            } else if (pwr_off_send_ret != ESP_ERR_NOT_FOUND) {
+                ESP_LOGW(TAG, "send slave power off cmd failed: %s", esp_err_to_name(pwr_off_send_ret));
             }
+
+            if (!got_ack) {
+                ESP_LOGW(TAG, "slave power off ack timeout, continue local shutdown");
+            }
+
+            app_stop_normal_services();
+            app_prepare_clean_training_state();
+            ESP_LOGI(TAG, "device power off, services stopped");
         }
     }
 }
