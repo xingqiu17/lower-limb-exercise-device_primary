@@ -235,6 +235,8 @@ void master_keepalive_monitor_task(void *arg)
                          KEEP_ALIVE_TIMEOUT_MS,
                          g_slave_macs[i].mac[0], g_slave_macs[i].mac[1], g_slave_macs[i].mac[2],
                          g_slave_macs[i].mac[3], g_slave_macs[i].mac[4], g_slave_macs[i].mac[5]);
+
+                app_handle_slave_link_lost();
             }
         }
 
@@ -518,6 +520,8 @@ void ms_pairing_task(void *arg)
             if (master_evt_queue != NULL) {
                 xQueueReset(master_evt_queue);
             }
+            app_handle_slave_link_restored();
+            app_mark_pairing_task_done();
             vTaskDelete(NULL);
             break;
 

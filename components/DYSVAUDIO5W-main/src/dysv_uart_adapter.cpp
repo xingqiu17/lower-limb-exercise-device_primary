@@ -149,6 +149,24 @@ extern "C" esp_err_t dysv5w_play_track(uint8_t song_number)
     return ESP_OK;
 }
 
+extern "C" esp_err_t dysv5w_pause_playback(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
+    ESP_RETURN_ON_ERROR(lock_take(), TAG, "lock failed");
+    s_player.pausePlayback();
+    lock_give();
+    return ESP_OK;
+}
+
+extern "C" esp_err_t dysv5w_resume_playback(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");
+    ESP_RETURN_ON_ERROR(lock_take(), TAG, "lock failed");
+    s_player.resumePlayback();
+    lock_give();
+    return ESP_OK;
+}
+
 extern "C" esp_err_t dysv5w_stop_playback(void)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "adapter not initialized");

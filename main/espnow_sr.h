@@ -93,6 +93,12 @@ typedef struct {
 void ms_pairing_task(void *arg);
 void master_keepalive_monitor_task(void *arg);
 
+void app_handle_slave_link_lost(void);
+
+void app_handle_slave_link_restored(void);
+
+void app_mark_pairing_task_done(void);
+
 esp_err_t app_uart_write_handle(uint8_t *src_addr, void *data,
                                        size_t size, wifi_pkt_rx_ctrl_t *rx_ctrl);
 

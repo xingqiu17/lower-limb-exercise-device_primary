@@ -100,13 +100,39 @@ static TaskHandle_t s_pairing_task_handle = NULL;
 static TaskHandle_t s_keepalive_task_handle = NULL;
 static TaskHandle_t s_audio_evt_task_handle = NULL;
 
+typedef struct {
+    bool sequence_active;
+    bool action_playing;
+    bool resting;
+    bool completed_track[APP_ACTION_COUNT];
+    uint8_t current_action_io;
+    uint8_t current_action_round;
+    TickType_t rest_until_tick;
+    int8_t first_pressed_button;
+} app_training_session_t;
+
+typedef enum {
+    TRAINING_AUDIO_END_NONE = 0,
+    TRAINING_AUDIO_END_DISCONNECT,
+    TRAINING_AUDIO_END_SHUTDOWN,
+} training_audio_end_reason_t;
+
+static app_training_session_t s_training_session = {0};
+static bool s_training_link_lost = false;
+static volatile training_audio_end_reason_t s_training_audio_end_reason = TRAINING_AUDIO_END_NONE;
+
 static esp_err_t app_start_normal_services(void);
 static void app_stop_normal_services(void);
 static void app_stop_user_visible_output_now(void);
 static void app_clear_audio_event_queue(void);
 static void app_prepare_clean_training_state(void);
+static esp_err_t app_start_pairing_task_if_needed(void);
+static void app_pause_training_output(void);
+static void app_reset_sequence_state(app_training_session_t *session);
 static bool app_is_training_flow_allowed(void);
 static bool app_delay_abort_on_shutdown(uint32_t delay_ms);
+static void app_mark_training_audio_end_reason(training_audio_end_reason_t reason);
+static bool app_consume_training_audio_end_reason(void);
 
 static const app_music_trigger_t *app_get_music_trigger(uint8_t track_index)
 {
@@ -422,26 +448,75 @@ static bool app_is_all_tracks_completed(const bool *completed_track)
     return true;
 }
 
-static void app_reset_sequence_state(bool *sequence_active,
-                                     bool *action_playing,
-                                     bool *resting,
-                                     bool *completed_track,
-                                     uint8_t *current_action_io,
-                                     uint8_t *current_action_round,
-                                     TickType_t *rest_until_tick,
-                                     int8_t *first_pressed_button)
+static void app_reset_sequence_state(app_training_session_t *session)
 {
     app_stop_current_action_flow();
-    *sequence_active = false;
-    *action_playing = false;
-    *resting = false;
+    session->sequence_active = false;
+    session->action_playing = false;
+    session->resting = false;
     for (uint8_t i = 0; i < APP_ACTION_COUNT; ++i) {
-        completed_track[i] = false;
+        session->completed_track[i] = false;
     }
-    *current_action_io = 0;
-    *current_action_round = 0;
-    *rest_until_tick = 0;
-    *first_pressed_button = -1;
+    session->current_action_io = 0;
+    session->current_action_round = 0;
+    session->rest_until_tick = 0;
+    session->first_pressed_button = -1;
+}
+
+static void app_mark_training_audio_end_reason(training_audio_end_reason_t reason)
+{
+    s_training_audio_end_reason = reason;
+}
+
+static bool app_consume_training_audio_end_reason(void)
+{
+    if (s_training_audio_end_reason == TRAINING_AUDIO_END_NONE) {
+        return false;
+    }
+
+    s_training_audio_end_reason = TRAINING_AUDIO_END_NONE;
+    return true;
+}
+
+static void app_pause_training_output(void)
+{
+    if (s_gpio2_start_delay_timer != NULL) {
+        (void)xTimerStop(s_gpio2_start_delay_timer, 0);
+    }
+    if (s_gpio2_toggle_timer != NULL) {
+        (void)xTimerStop(s_gpio2_toggle_timer, 0);
+    }
+
+    s_action_running = false;
+    s_gpio2_action_mode = 0;
+    s_gpio2_blink_enabled = false;
+    s_gpio2_indicator_started = false;
+    app_gpio2_refresh_display();
+
+    (void)audio_play_set_io_mask(0xFF);
+    (void)neopixel_ctrl_set_gpio1_progress_red(0);
+    (void)neopixel_ctrl_set_gpio2_action_panel(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+static esp_err_t app_start_pairing_task_if_needed(void)
+{
+    if (s_pairing_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    BaseType_t task_ok = xTaskCreate(ms_pairing_task,
+                                     "ms_pairing",
+                                     4096,
+                                     NULL,
+                                     4,
+                                     &s_pairing_task_handle);
+    ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create ms_pairing_task failed");
+    return ESP_OK;
+}
+
+void app_mark_pairing_task_done(void)
+{
+    s_pairing_task_handle = NULL;
 }
 
 static bool app_is_training_flow_allowed(void)
@@ -468,20 +543,54 @@ static bool app_delay_abort_on_shutdown(uint32_t delay_ms)
     }
 }
 
+void app_handle_slave_link_lost(void)
+{
+    if (s_training_link_lost) {
+        return;
+    }
+
+    s_training_link_lost = true;
+    app_mark_training_audio_end_reason(TRAINING_AUDIO_END_DISCONNECT);
+
+    esp_err_t pause_ret = audio_play_pause_playback();
+    if ((pause_ret != ESP_OK) && (pause_ret != ESP_ERR_INVALID_STATE)) {
+        ESP_LOGW(TAG, "pause music on link loss failed: %s", esp_err_to_name(pause_ret));
+    }
+
+    app_reset_sequence_state(&s_training_session);
+    app_pause_training_output();
+    app_clear_audio_event_queue();
+
+    esp_err_t pairing_ret = app_start_pairing_task_if_needed();
+    if (pairing_ret != ESP_OK) {
+        ESP_LOGW(TAG, "restart pairing task failed after link loss: %s", esp_err_to_name(pairing_ret));
+    }
+
+    ESP_LOGW(TAG, "training link lost, return to pairing mode");
+}
+
+void app_handle_slave_link_restored(void)
+{
+    if (!s_training_link_lost) {
+        return;
+    }
+
+    s_training_link_lost = false;
+    app_mark_training_audio_end_reason(TRAINING_AUDIO_END_NONE);
+
+    app_reset_sequence_state(&s_training_session);
+    app_clear_audio_event_queue();
+
+    ESP_LOGI(TAG, "training link restored");
+}
+
 
 
 static void audio_play_event_task(void *arg)
 {
     QueueHandle_t evt_queue = audio_play_get_event_queue();
     audio_play_event_t evt;
-    bool sequence_active = false;
-    bool action_playing = false;
-    bool resting = false;
-    bool completed_track[APP_ACTION_COUNT] = {0};
-    uint8_t current_action_io = 0;
-    uint8_t current_action_round = 0;
-    TickType_t rest_until_tick = 0;
-    int8_t first_pressed_button = -1;
+    app_training_session_t *session = &s_training_session;
 
     if (evt_queue == NULL) {
         ESP_LOGE(TAG, "audio_play event queue is null");
@@ -492,15 +601,8 @@ static void audio_play_event_task(void *arg)
     while (true) {
         // 关机态只做事件清理，不执行业务流程。
         if (!s_device_power_on) {
-            if (sequence_active || action_playing || resting) {
-                app_reset_sequence_state(&sequence_active,
-                                         &action_playing,
-                                         &resting,
-                                         completed_track,
-                                         &current_action_io,
-                                         &current_action_round,
-                                         &rest_until_tick,
-                                         &first_pressed_button);
+            if (session->sequence_active || session->action_playing || session->resting) {
+                app_reset_sequence_state(session);
             }
 
             if (xQueueReceive(evt_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -509,16 +611,14 @@ static void audio_play_event_task(void *arg)
             continue;
         }
 
+        if (s_training_link_lost) {
+            (void)xQueueReceive(evt_queue, &evt, pdMS_TO_TICKS(100));
+            continue;
+        }
+
         if (xQueueReceive(evt_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (!app_is_training_flow_allowed()) {
-                app_reset_sequence_state(&sequence_active,
-                                         &action_playing,
-                                         &resting,
-                                         completed_track,
-                                         &current_action_io,
-                                         &current_action_round,
-                                         &rest_until_tick,
-                                         &first_pressed_button);
+                app_reset_sequence_state(session);
                 continue;
             }
 
@@ -530,84 +630,70 @@ static void audio_play_event_task(void *arg)
                     continue;
                 }
 
-                if (sequence_active) {
+                if (session->sequence_active) {
                     ESP_LOGI(TAG, "button%u ignored, sequence is running/resting", evt.button_index);
                     continue;
                 }
 
-                sequence_active = true;
-                action_playing = false;
-                resting = false;
+                session->sequence_active = true;
+                session->action_playing = false;
+                session->resting = false;
                 for (uint8_t i = 0; i < APP_ACTION_COUNT; ++i) {
-                    completed_track[i] = false;
+                    session->completed_track[i] = false;
                 }
-                current_action_io = logical_io;
-                current_action_round = 0;
-                rest_until_tick = 0;
-                first_pressed_button = (int8_t)evt.button_index;
+                session->current_action_io = logical_io;
+                session->current_action_round = 0;
+                session->rest_until_tick = 0;
+                session->first_pressed_button = (int8_t)evt.button_index;
 
-                esp_err_t play_ret = app_start_action_flow(current_action_io);
+                esp_err_t play_ret = app_start_action_flow(session->current_action_io);
                 if (play_ret != ESP_OK) {
-                    ESP_LOGE(TAG, "button%u start sequence IO%u failed: %s", evt.button_index, current_action_io, esp_err_to_name(play_ret));
-                    app_reset_sequence_state(&sequence_active,
-                                             &action_playing,
-                                             &resting,
-                                             completed_track,
-                                             &current_action_io,
-                                             &current_action_round,
-                                             &rest_until_tick,
-                                             &first_pressed_button);
+                    ESP_LOGE(TAG, "button%u start sequence IO%u failed: %s", evt.button_index, session->current_action_io, esp_err_to_name(play_ret));
+                    app_reset_sequence_state(session);
                     continue;
                 }
 
-                action_playing = true;
+                session->action_playing = true;
                 ESP_LOGI(TAG,
                          "button%u pressed, start music%u round%u",
                          evt.button_index,
-                         (unsigned)app_get_music_id(current_action_io),
-                         (unsigned)(current_action_round + 1U));
+                         (unsigned)app_get_music_id(session->current_action_io),
+                         (unsigned)(session->current_action_round + 1U));
                 continue;
             }
 
             if (evt.type == AUDIO_PLAY_EVENT_BUSY_RISING) {
                 ESP_LOGI(TAG, "recv BUSY rising event, tick=%lu", (unsigned long)evt.tick);
 
-                if (!sequence_active || !action_playing) {
+                bool forced_audio_end = app_consume_training_audio_end_reason();
+
+                if (!session->sequence_active || !session->action_playing) {
                     continue;
                 }
 
                 app_stop_current_action_flow();
-                action_playing = false;
+                session->action_playing = false;
 
-                if ((current_action_round + 1U) < APP_PLAYS_PER_ACTION) {
-                    current_action_round++;
-                    resting = true;
-                    rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
+                if (forced_audio_end) {
+                    app_reset_sequence_state(session);
+                    continue;
+                }
 
-                    uint16_t finished_action_music_id = app_get_music_id(current_action_io);
+                if ((session->current_action_round + 1U) < APP_PLAYS_PER_ACTION) {
+                    session->current_action_round++;
+                    session->resting = true;
+                    session->rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
+
+                    uint16_t finished_action_music_id = app_get_music_id(session->current_action_io);
                     uint16_t prompt_music_id = app_get_round_rest_prompt_music_id(finished_action_music_id);
                     if (prompt_music_id != 0) {
                         if (!app_delay_abort_on_shutdown(APP_PROMPT_DELAY_AFTER_STOP_MS)) {
-                            app_reset_sequence_state(&sequence_active,
-                                                     &action_playing,
-                                                     &resting,
-                                                     completed_track,
-                                                     &current_action_io,
-                                                     &current_action_round,
-                                                     &rest_until_tick,
-                                                     &first_pressed_button);
+                            app_reset_sequence_state(session);
                             continue;
                         }
 
                         if (!app_is_training_flow_allowed()) {
-                            app_reset_sequence_state(&sequence_active,
-                                                     &action_playing,
-                                                     &resting,
-                                                     completed_track,
-                                                     &current_action_io,
-                                                     &current_action_round,
-                                                     &rest_until_tick,
-                                                     &first_pressed_button);
+                            app_reset_sequence_state(session);
                             continue;
                         }
 
@@ -628,65 +714,43 @@ static void audio_play_event_task(void *arg)
 
                     ESP_LOGI(TAG,
                              "music%u round%u done, rest %ums then repeat",
-                             (unsigned)app_get_music_id(current_action_io),
-                             (unsigned)current_action_round,
+                             (unsigned)app_get_music_id(session->current_action_io),
+                             (unsigned)session->current_action_round,
                              (unsigned)APP_REST_TIME_MS);
                     continue;
                 }
 
-                completed_track[current_action_io] = true;
+                session->completed_track[session->current_action_io] = true;
 
-                if (app_is_all_tracks_completed(completed_track)) {
-                    ESP_LOGI(TAG, "all actions done after button%u, stop sequence", (unsigned)first_pressed_button);
-                    app_reset_sequence_state(&sequence_active,
-                                             &action_playing,
-                                             &resting,
-                                             completed_track,
-                                             &current_action_io,
-                                             &current_action_round,
-                                             &rest_until_tick,
-                                             &first_pressed_button);
+                if (app_is_all_tracks_completed(session->completed_track)) {
+                    ESP_LOGI(TAG, "all actions done after button%u, stop sequence", (unsigned)session->first_pressed_button);
+                    app_reset_sequence_state(session);
                     continue;
                 }
 
-                int16_t next_action = app_find_next_action(current_action_io, completed_track);
+                int16_t next_action = app_find_next_action(session->current_action_io, session->completed_track);
                 if (next_action < 0) {
                     ESP_LOGW(TAG, "next action not found, stop sequence");
-                    app_reset_sequence_state(&sequence_active,
-                                             &action_playing,
-                                             &resting,
-                                             completed_track,
-                                             &current_action_io,
-                                             &current_action_round,
-                                             &rest_until_tick,
-                                             &first_pressed_button);
+                    app_reset_sequence_state(session);
                     continue;
                 }
 
-                uint16_t finished_action_music_id = app_get_music_id(current_action_io);
+                uint16_t finished_action_music_id = app_get_music_id(session->current_action_io);
                 uint16_t prompt_music_id = app_get_action_finish_prompt_music_id(finished_action_music_id);
+
+                session->current_action_io = (uint8_t)next_action;
+                session->current_action_round = 0;
+                session->resting = true;
+                session->rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
+
                 if (prompt_music_id != 0) {
                     if (!app_delay_abort_on_shutdown(APP_PROMPT_DELAY_AFTER_STOP_MS)) {
-                        app_reset_sequence_state(&sequence_active,
-                                                 &action_playing,
-                                                 &resting,
-                                                 completed_track,
-                                                 &current_action_io,
-                                                 &current_action_round,
-                                                 &rest_until_tick,
-                                                 &first_pressed_button);
+                        app_reset_sequence_state(session);
                         continue;
                     }
 
                     if (!app_is_training_flow_allowed()) {
-                        app_reset_sequence_state(&sequence_active,
-                                                 &action_playing,
-                                                 &resting,
-                                                 completed_track,
-                                                 &current_action_io,
-                                                 &current_action_round,
-                                                 &rest_until_tick,
-                                                 &first_pressed_button);
+                        app_reset_sequence_state(session);
                         continue;
                     }
 
@@ -705,52 +769,34 @@ static void audio_play_event_task(void *arg)
                     }
                 }
 
-                current_action_io = (uint8_t)next_action;
-                current_action_round = 0;
-                resting = true;
-                rest_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(APP_REST_TIME_MS);
-                ESP_LOGI(TAG, "music switch to %u after rest %ums", (unsigned)app_get_music_id(current_action_io), (unsigned)APP_REST_TIME_MS);
+                ESP_LOGI(TAG, "music switch to %u after rest %ums", (unsigned)app_get_music_id(session->current_action_io), (unsigned)APP_REST_TIME_MS);
             }
         }
 
-        if (sequence_active && resting) {
+        if (session->sequence_active && session->resting) {
             if (!app_is_training_flow_allowed()) {
-                app_reset_sequence_state(&sequence_active,
-                                         &action_playing,
-                                         &resting,
-                                         completed_track,
-                                         &current_action_io,
-                                         &current_action_round,
-                                         &rest_until_tick,
-                                         &first_pressed_button);
+                app_reset_sequence_state(session);
                 continue;
             }
 
             TickType_t now = xTaskGetTickCount();
-            if ((int32_t)(now - rest_until_tick) >= 0) {
-                esp_err_t play_ret = app_start_action_flow(current_action_io);
+            if ((int32_t)(now - session->rest_until_tick) >= 0) {
+                esp_err_t play_ret = app_start_action_flow(session->current_action_io);
                 if (play_ret != ESP_OK) {
                     ESP_LOGE(TAG, "start action%u round%u after rest failed: %s",
-                             (unsigned)(current_action_io + 1U),
-                             (unsigned)(current_action_round + 1U),
+                             (unsigned)(session->current_action_io + 1U),
+                             (unsigned)(session->current_action_round + 1U),
                              esp_err_to_name(play_ret));
-                    app_reset_sequence_state(&sequence_active,
-                                             &action_playing,
-                                             &resting,
-                                             completed_track,
-                                             &current_action_io,
-                                             &current_action_round,
-                                             &rest_until_tick,
-                                             &first_pressed_button);
+                    app_reset_sequence_state(session);
                     continue;
                 }
 
-                resting = false;
-                action_playing = true;
+                session->resting = false;
+                session->action_playing = true;
                 ESP_LOGI(TAG,
                          "start music%u round%u after rest",
-                         (unsigned)app_get_music_id(current_action_io),
-                         (unsigned)(current_action_round + 1U));
+                         (unsigned)app_get_music_id(session->current_action_io),
+                         (unsigned)(session->current_action_round + 1U));
             }
         }
     }
@@ -843,8 +889,10 @@ static void app_clear_audio_event_queue(void)
 
 static void app_prepare_clean_training_state(void)
 {
+    s_training_link_lost = false;
+    app_mark_training_audio_end_reason(TRAINING_AUDIO_END_NONE);
     master_set_current_action_mode(0);
-    app_set_action_running(false, 0);
+    app_reset_sequence_state(&s_training_session);
     app_clear_audio_event_queue();
 }
 
@@ -870,13 +918,9 @@ static esp_err_t app_start_normal_services(void)
     ESP_RETURN_ON_ERROR(audio_play_set_io_mask(0xFF), TAG, "set audio io mask failed");
     ESP_RETURN_ON_ERROR(espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, master_receive_handle), TAG, "set espnow data callback failed");
 
-    BaseType_t task_ok = xTaskCreate(ms_pairing_task,
-                                     "ms_pairing",
-                                     4096,
-                                     NULL,
-                                     4,
-                                     &s_pairing_task_handle);
-    ESP_RETURN_ON_FALSE(task_ok == pdPASS, ESP_FAIL, TAG, "create ms_pairing_task failed");
+    BaseType_t task_ok = pdFAIL;
+
+    ESP_RETURN_ON_ERROR(app_start_pairing_task_if_needed(), TAG, "create ms_pairing_task failed");
 
     task_ok = xTaskCreate(master_keepalive_monitor_task,
                           "ms_keepalive",
@@ -1018,6 +1062,7 @@ void app_main()
         uint8_t evt = 0;
         if (xQueueReceive(s_power_key_evt_queue, &evt, portMAX_DELAY) == pdTRUE) {
             master_set_shutdown_in_progress(true);
+            app_mark_training_audio_end_reason(TRAINING_AUDIO_END_SHUTDOWN);
 
             // 1) 用户可见输出立即停止（零体感延迟）
             app_stop_user_visible_output_now();

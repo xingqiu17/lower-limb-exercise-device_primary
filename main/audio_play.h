@@ -42,6 +42,10 @@ esp_err_t audio_play_trigger_once(uint8_t logical_io, uint32_t low_time_ms);
 
 esp_err_t audio_play_trigger_mask_once(uint8_t bit_mask, uint32_t low_time_ms);
 
+esp_err_t audio_play_pause_playback(void);
+
+esp_err_t audio_play_resume_playback(void);
+
 esp_err_t audio_play_stop_playback(void);
 
 esp_err_t audio_play_set_encoder_enabled(bool enabled);

@@ -393,6 +393,20 @@ esp_err_t audio_play_trigger_mask_once(uint8_t bit_mask, uint32_t low_time_ms)
 	return ESP_OK;
 }
 
+esp_err_t audio_play_pause_playback(void)
+{
+	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
+	ESP_RETURN_ON_ERROR(dysv5w_pause_playback(), TAG, "pause playback failed");
+	return ESP_OK;
+}
+
+esp_err_t audio_play_resume_playback(void)
+{
+	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
+	ESP_RETURN_ON_ERROR(dysv5w_resume_playback(), TAG, "resume playback failed");
+	return ESP_OK;
+}
+
 esp_err_t audio_play_stop_playback(void)
 {
 	ESP_RETURN_ON_FALSE(s_is_initialized, ESP_ERR_INVALID_STATE, TAG, "audio_play not initialized");
