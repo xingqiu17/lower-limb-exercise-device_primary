@@ -27,7 +27,15 @@ extern uint32_t g_current_action_mode;
 extern uint32_t g_current_action_count;
 
 
-#define MAX_SLAVES  1
+#define MAX_SLAVES  2
+
+// Set to 0 to compile out the boot TEST packet task.
+#ifndef ESPNOW_SR_TEST_TASK_ENABLE
+#define ESPNOW_SR_TEST_TASK_ENABLE 0
+#endif
+
+#define ESPNOW_SR_TEST_PACKET_COUNT       100
+#define ESPNOW_SR_TEST_PACKET_INTERVAL_MS 100
 //TODO 待修改
 
 
@@ -124,6 +132,12 @@ void master_set_shutdown_in_progress(bool in_progress);
 
 // Query shutdown flow state.
 bool master_is_shutdown_in_progress(void);
+
+// Start/stop the boot TEST task. It sends TEST data=0 and counts TEST data=1 replies.
+esp_err_t master_start_test_task(void);
+void master_stop_test_task(void);
+uint32_t master_get_test_reply_count(void);
+void master_reset_test_reply_count(void);
 
 
 

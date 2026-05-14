@@ -948,6 +948,11 @@ static esp_err_t app_start_normal_services(void)
         ESP_LOGW(TAG, "send slave power on cmd failed: %s", esp_err_to_name(pwr_on_ret));
     }
 
+    esp_err_t test_ret = master_start_test_task();
+    if (test_ret != ESP_OK) {
+        ESP_LOGW(TAG, "start TEST task failed: %s", esp_err_to_name(test_ret));
+    }
+
     ESP_LOGI(TAG, "device power on: normal services started");
     return ESP_OK;
 }
@@ -965,6 +970,8 @@ static void app_stop_normal_services(void)
     }
     (void)audio_play_set_encoder_enabled(false);
     (void)audio_play_set_io_mask(0xFF);
+
+    master_stop_test_task();
 
     if (s_keepalive_task_handle != NULL) {
         vTaskDelete(s_keepalive_task_handle);

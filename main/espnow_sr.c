@@ -19,6 +19,9 @@ uint32_t g_current_action_mode = 0;
 uint32_t g_current_action_count = 0;
 static bool g_pairing_event_accepting = true;
 static volatile bool g_shutdown_in_progress = false;
+static TaskHandle_t s_test_task_handle = NULL;
+static volatile bool s_test_task_enabled = false;
+static volatile uint32_t s_test_reply_count = 0;
 
 static TickType_t g_slave_last_keepalive_tick[MAX_SLAVES] = {0};
 static bool g_slave_keepalive_online[MAX_SLAVES] = {false};
@@ -172,6 +175,155 @@ static bool all_slaves_ready(void)
     }
 
     return (ready_cnt >= MAX_SLAVES);
+}
+
+#if ESPNOW_SR_TEST_TASK_ENABLE
+static esp_err_t master_send_test_to_ready_slaves(void)
+{
+    espnow_frame_head_t frame_head = {};
+    frame_head.retransmit_count = 1;
+    frame_head.broadcast = false;
+
+    esp_now_data cmd = {
+        .type = TEST,
+        .seq = seq++,
+        .data = 0,
+    };
+
+    uint8_t sent_count = 0;
+    esp_err_t last_err = ESP_OK;
+
+    for (int i = 0; i < MAX_SLAVES; i++) {
+        if (!g_slave_macs[i].valid || !g_slave_macs[i].ready) {
+            continue;
+        }
+
+        esp_err_t err = espnow_send(ESPNOW_DATA_TYPE_DATA,
+                                    g_slave_macs[i].mac,
+                                    &cmd,
+                                    sizeof(cmd),
+                                    &frame_head,
+                                    portMAX_DELAY);
+        if (err == ESP_OK) {
+            sent_count++;
+        } else {
+            last_err = err;
+            ESP_LOGW(TAG,
+                     "TEST send failed to %02X:%02X:%02X:%02X:%02X:%02X, err=%s",
+                     g_slave_macs[i].mac[0], g_slave_macs[i].mac[1], g_slave_macs[i].mac[2],
+                     g_slave_macs[i].mac[3], g_slave_macs[i].mac[4], g_slave_macs[i].mac[5],
+                     esp_err_to_name(err));
+        }
+    }
+
+    if (sent_count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return last_err;
+}
+
+static void master_test_task(void *arg)
+{
+    (void)arg;
+
+    uint32_t sent = 0;
+    TickType_t last_wait_log_tick = 0;
+
+    s_test_reply_count = 0;
+    ESP_LOGI(TAG,
+             "TEST task start: send %u packets, interval=%u ms",
+             (unsigned)ESPNOW_SR_TEST_PACKET_COUNT,
+             (unsigned)ESPNOW_SR_TEST_PACKET_INTERVAL_MS);
+
+    while (s_test_task_enabled && sent < ESPNOW_SR_TEST_PACKET_COUNT) {
+        if (g_shutdown_in_progress) {
+            vTaskDelay(pdMS_TO_TICKS(ESPNOW_SR_TEST_PACKET_INTERVAL_MS));
+            continue;
+        }
+
+        esp_err_t err = master_send_test_to_ready_slaves();
+        if (err == ESP_OK) {
+            sent++;
+            ESP_LOGI(TAG,
+                     "TEST sent %lu/%u, reply_count=%lu",
+                     (unsigned long)sent,
+                     (unsigned)ESPNOW_SR_TEST_PACKET_COUNT,
+                     (unsigned long)s_test_reply_count);
+        } else if (err == ESP_ERR_NOT_FOUND) {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_wait_log_tick) >= pdMS_TO_TICKS(1000)) {
+                ESP_LOGI(TAG, "TEST task waiting for READY slave");
+                last_wait_log_tick = now;
+            }
+        } else {
+            ESP_LOGW(TAG, "TEST send error: %s", esp_err_to_name(err));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ESPNOW_SR_TEST_PACKET_INTERVAL_MS));
+    }
+
+    ESP_LOGI(TAG,
+             "TEST task done: sent=%lu, reply_count=%lu",
+             (unsigned long)sent,
+             (unsigned long)s_test_reply_count);
+    s_test_task_enabled = false;
+    s_test_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+#endif
+
+esp_err_t master_start_test_task(void)
+{
+#if ESPNOW_SR_TEST_TASK_ENABLE
+    if (s_test_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    s_test_task_enabled = true;
+    s_test_reply_count = 0;
+
+    BaseType_t task_ok = xTaskCreate(master_test_task,
+                                     "ms_test",
+                                     3072,
+                                     NULL,
+                                     3,
+                                     &s_test_task_handle);
+    if (task_ok != pdPASS) {
+        s_test_task_enabled = false;
+        s_test_task_handle = NULL;
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+#else
+    ESP_LOGI(TAG, "TEST task disabled by ESPNOW_SR_TEST_TASK_ENABLE=0");
+    return ESP_OK;
+#endif
+}
+
+void master_stop_test_task(void)
+{
+#if ESPNOW_SR_TEST_TASK_ENABLE
+    s_test_task_enabled = false;
+
+    if (s_test_task_handle != NULL) {
+        TaskHandle_t task = s_test_task_handle;
+        s_test_task_handle = NULL;
+        vTaskDelete(task);
+        ESP_LOGI(TAG, "TEST task stopped");
+    }
+#endif
+}
+
+uint32_t master_get_test_reply_count(void)
+{
+    return s_test_reply_count;
+}
+
+void master_reset_test_reply_count(void)
+{
+    s_test_reply_count = 0;
 }
 
 static void update_slave_keepalive_tick(const uint8_t *mac)
@@ -691,8 +843,18 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
         }
     }break;
 
-
-
+    case TEST: {
+        if (pkt->data == 1) {
+            uint32_t reply_count = ++s_test_reply_count;
+            ESP_LOGI(TAGR,
+                     "TEST reply count=%lu from %02X:%02X:%02X:%02X:%02X:%02X",
+                     (unsigned long)reply_count,
+                     src_addr[0], src_addr[1], src_addr[2],
+                     src_addr[3], src_addr[4], src_addr[5]);
+        } else {
+            ESP_LOGI(TAGR, "Ignore TEST packet data=%lu", (unsigned long)pkt->data);
+        }
+    }break;
 
     default:{
       ESP_LOGW(TAG,
