@@ -69,10 +69,10 @@ static const app_music_trigger_t s_music_trigger_table[] = {
     {6, 0xF9},
     {7, 0xF8},
     {8, 0xF7},
-    {9, 0xF6},
-    {10, 0xF5},
-    {11, 0xF4},
-    {12, 0xF3},
+    {9, 0xF6},              //开机提示音
+    {10, 0xF5},             //关机提示音
+    {11, 0xF4},             //等待设备连接提示音
+    {12, 0xF3},             //
     {13, 0xF2},
 };
 
@@ -99,6 +99,7 @@ static QueueHandle_t s_power_key_evt_queue = NULL;
 static TaskHandle_t s_pairing_task_handle = NULL;
 static TaskHandle_t s_keepalive_task_handle = NULL;
 static TaskHandle_t s_audio_evt_task_handle = NULL;
+static bool s_auto_start_training_pending = false;
 
 typedef struct {
     bool sequence_active;
@@ -133,6 +134,7 @@ static bool app_is_training_flow_allowed(void);
 static bool app_delay_abort_on_shutdown(uint32_t delay_ms);
 static void app_mark_training_audio_end_reason(training_audio_end_reason_t reason);
 static bool app_consume_training_audio_end_reason(void);
+static bool app_start_training_sequence(app_training_session_t *session, uint8_t start_action_io, int8_t trigger_button);
 
 static const app_music_trigger_t *app_get_music_trigger(uint8_t track_index)
 {
@@ -204,6 +206,16 @@ static esp_err_t app_play_music_by_id(uint16_t music_id)
     return audio_play_trigger_mask_once(track->trigger_mask, APP_TRIGGER_LOW_TIME_MS);
 }
 
+static esp_err_t app_play_prompt_music(uint16_t music_id)
+{
+    esp_err_t play_ret = app_play_music_by_id(music_id);
+    if (play_ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(APP_PROMPT_DELAY_AFTER_STOP_MS));
+    }
+
+    return play_ret;
+}
+
 static bool app_gpio2_get_phase_ms(uint32_t action_mode, bool red_phase, uint32_t *phase_ms)
 {
     if (phase_ms == NULL) {
@@ -254,17 +266,17 @@ static void app_gpio2_refresh_display(void)
             if ((s_gpio2_action_mode == 1U) || (s_gpio2_action_mode == 2U)) {
                 if (s_gpio2_is_red) {
                     indicator1_on = 1;
-                    indicator1_r = 255;
+                    indicator1_b = 255;
                 } else {
                     indicator2_on = 1;
-                    indicator2_g = 255;
+                    indicator2_b = 255;
                 }
             } else if ((s_gpio2_action_mode == 3U) || (s_gpio2_action_mode == 4U)) {
                 if (s_gpio2_is_red) {
                     indicator1_on = 1;
-                    indicator1_r = 255;
+                    indicator1_b = 255;
                     indicator2_on = 1;
-                    indicator2_r = 255;
+                    indicator2_b = 255;
                 }
             }
         }
@@ -543,6 +555,54 @@ static bool app_delay_abort_on_shutdown(uint32_t delay_ms)
     }
 }
 
+static bool app_start_training_sequence(app_training_session_t *session, uint8_t start_action_io, int8_t trigger_button)
+{
+    if (session == NULL) {
+        return false;
+    }
+
+    if (start_action_io >= APP_ACTION_COUNT) {
+        return false;
+    }
+
+    session->sequence_active = true;
+    session->action_playing = false;
+    session->resting = false;
+    for (uint8_t i = 0; i < APP_ACTION_COUNT; ++i) {
+        session->completed_track[i] = false;
+    }
+    session->current_action_io = start_action_io;
+    session->current_action_round = 0;
+    session->rest_until_tick = 0;
+    session->first_pressed_button = trigger_button;
+
+    esp_err_t play_ret = app_start_action_flow(session->current_action_io);
+    if (play_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "start sequence IO%u failed: %s",
+                 (unsigned)session->current_action_io,
+                 esp_err_to_name(play_ret));
+        app_reset_sequence_state(session);
+        return false;
+    }
+
+    session->action_playing = true;
+    if (trigger_button >= 0) {
+        ESP_LOGI(TAG,
+                 "button%u pressed, start music%u round%u",
+                 (unsigned)trigger_button,
+                 (unsigned)app_get_music_id(session->current_action_io),
+                 (unsigned)(session->current_action_round + 1U));
+    } else {
+        ESP_LOGI(TAG,
+                 "auto start training, start music%u round%u",
+                 (unsigned)app_get_music_id(session->current_action_io),
+                 (unsigned)(session->current_action_round + 1U));
+    }
+
+    return true;
+}
+
 void app_handle_slave_link_lost(void)
 {
     if (s_training_link_lost) {
@@ -571,15 +631,32 @@ void app_handle_slave_link_lost(void)
 
 void app_handle_slave_link_restored(void)
 {
-    if (!s_training_link_lost) {
-        return;
-    }
+    bool should_auto_start = s_auto_start_training_pending;
 
     s_training_link_lost = false;
     app_mark_training_audio_end_reason(TRAINING_AUDIO_END_NONE);
 
     app_reset_sequence_state(&s_training_session);
     app_clear_audio_event_queue();
+
+    if (should_auto_start) {
+        s_auto_start_training_pending = false;
+        if (!app_is_training_flow_allowed()) {
+            ESP_LOGW(TAG, "auto start skipped: training flow not allowed");
+            return;
+        }
+
+        if (app_start_training_sequence(&s_training_session, 0, -1)) {
+            ESP_LOGI(TAG, "training link ready, auto start from action1");
+        } else {
+            ESP_LOGW(TAG, "auto start training failed after link ready");
+        }
+        return;
+    }
+
+    if (!s_training_link_lost) {
+        return;
+    }
 
     ESP_LOGI(TAG, "training link restored");
 }
@@ -635,30 +712,11 @@ static void audio_play_event_task(void *arg)
                     continue;
                 }
 
-                session->sequence_active = true;
-                session->action_playing = false;
-                session->resting = false;
-                for (uint8_t i = 0; i < APP_ACTION_COUNT; ++i) {
-                    session->completed_track[i] = false;
-                }
-                session->current_action_io = logical_io;
-                session->current_action_round = 0;
-                session->rest_until_tick = 0;
-                session->first_pressed_button = (int8_t)evt.button_index;
-
-                esp_err_t play_ret = app_start_action_flow(session->current_action_io);
-                if (play_ret != ESP_OK) {
-                    ESP_LOGE(TAG, "button%u start sequence IO%u failed: %s", evt.button_index, session->current_action_io, esp_err_to_name(play_ret));
-                    app_reset_sequence_state(session);
+                if (!app_start_training_sequence(session, logical_io, (int8_t)evt.button_index)) {
+                    ESP_LOGE(TAG, "button%u start sequence IO%u failed", evt.button_index, logical_io);
                     continue;
                 }
 
-                session->action_playing = true;
-                ESP_LOGI(TAG,
-                         "button%u pressed, start music%u round%u",
-                         evt.button_index,
-                         (unsigned)app_get_music_id(session->current_action_io),
-                         (unsigned)(session->current_action_round + 1U));
                 continue;
             }
 
@@ -723,7 +781,11 @@ static void audio_play_event_task(void *arg)
                 session->completed_track[session->current_action_io] = true;
 
                 if (app_is_all_tracks_completed(session->completed_track)) {
-                    ESP_LOGI(TAG, "all actions done after button%u, stop sequence", (unsigned)session->first_pressed_button);
+                    if (session->first_pressed_button >= 0) {
+                        ESP_LOGI(TAG, "all actions done after button%u, return to idle", (unsigned)session->first_pressed_button);
+                    } else {
+                        ESP_LOGI(TAG, "all actions done after auto start, return to idle");
+                    }
                     app_reset_sequence_state(session);
                     continue;
                 }
@@ -1061,7 +1123,14 @@ void app_main()
             }
 
             app_prepare_clean_training_state();
+            s_auto_start_training_pending = true;
             s_device_power_on = true;
+
+            esp_err_t prompt_ret = app_play_prompt_music(12);
+            if (prompt_ret != ESP_OK) {
+                ESP_LOGW(TAG, "play connection prompt music12 failed: %s", esp_err_to_name(prompt_ret));
+            }
+
             ESP_LOGI(TAG, "device power on by GPIO13");
             continue;
         }
@@ -1074,6 +1143,11 @@ void app_main()
             // 1) 用户可见输出立即停止（零体感延迟）
             app_stop_user_visible_output_now();
             s_device_power_on = false;
+
+            esp_err_t shutdown_prompt_ret = app_play_prompt_music(9);
+            if (shutdown_prompt_ret != ESP_OK) {
+                ESP_LOGW(TAG, "play shutdown prompt music9 failed: %s", esp_err_to_name(shutdown_prompt_ret));
+            }
 
             // 2) 主机向从机发关机指令（data=0），并等待从机确认（data=2）
             esp_err_t pwr_off_send_ret = master_send_power_manage_to_ready_slaves(0);

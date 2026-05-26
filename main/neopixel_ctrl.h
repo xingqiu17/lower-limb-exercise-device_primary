@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define NEOPIXEL_CTRL_LED_COUNT 12U
+#define NEOPIXEL_CTRL_LED_COUNT 13U
 
 esp_err_t neopixel_ctrl_init(void);
 

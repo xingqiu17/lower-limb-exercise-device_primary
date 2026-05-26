@@ -768,8 +768,12 @@ esp_err_t master_receive_handle(uint8_t *src_addr,
 
         if (mode == g_current_action_mode && mode >= 1 && mode <= 4) {
             g_current_action_count++;
+            uint16_t progress_led_count = (uint16_t)(g_current_action_count / 2U);
+            if (progress_led_count > 10U) {
+                progress_led_count = 10U;
+            }
 
-            esp_err_t led_ret = neopixel_ctrl_set_gpio1_progress_red((uint16_t)g_current_action_count);
+            esp_err_t led_ret = neopixel_ctrl_set_gpio1_progress_red(progress_led_count);
             if (led_ret != ESP_OK) {
                 ESP_LOGW(TAGR,
                          "Update GPIO1 progress LED failed, count=%lu, err=%s",
